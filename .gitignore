@@ -1,0 +1,13 @@
+# 每個使用者自己剪的專案（原始影片、逐字稿、成品）——不要進版控
+projects/
+
+# Python
+__pycache__/
+*.pyc
+
+# 逐字編輯器的自動備份
+06_meta/.backups/
+
+# 系統/編輯器雜項
+.DS_Store
+Thumbs.db

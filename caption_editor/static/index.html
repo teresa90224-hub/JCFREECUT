@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>edit_state 編輯器</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: "Microsoft JhengHei", "Segoe UI", sans-serif; margin: 0; background: #f4f5f7; color: #222; }
+  header { background: #1b1d29; color: #fff; padding: 12px 20px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  header select, header button { font-size: 14px; padding: 6px 10px; border-radius: 6px; border: none; }
+  header button { background: #ff6d5a; color: #fff; cursor: pointer; font-weight: bold; }
+  header button:disabled { background: #888; cursor: not-allowed; }
+  main { display: grid; grid-template-columns: 380px 1fr; gap: 16px; padding: 16px; align-items: start; }
+  section.panel { background: #fff; border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  h2 { font-size: 15px; margin: 0 0 10px; color: #1b1d29; }
+  video { width: 100%; border-radius: 8px; background: #000; }
+  label.field { display: block; font-size: 12px; color: #555; margin: 8px 0 3px; }
+  input[type=text], textarea.card, select { width: 100%; box-sizing: border-box; padding: 6px 8px; font-size: 13px; border: 1px solid #ccc; border-radius: 6px; font-family: inherit; }
+  #status { font-size: 13px; color: #ddd; }
+  #renderLog { white-space: pre-wrap; font-family: consolas, monospace; font-size: 11px; background: #111; color: #9f9; padding: 8px; border-radius: 6px; max-height: 200px; overflow-y: auto; display: none; }
+  .colorrow { display: flex; gap: 10px; align-items: center; }
+  .colorrow input[type=color] { width: 46px; height: 30px; padding: 0; border: 1px solid #ccc; }
+
+  #wordStream { font-size: 17px; line-height: 2.9; word-break: break-all; }
+  .word-tok { position: relative; display: inline-block; padding: 3px 5px; margin: 1px; border-radius: 4px; outline: none; }
+  .word-tok:hover { background: #eef0f4; }
+  .word-tok.emph-word { color: #ff6d5a; font-weight: bold; }
+  /* 拖曳斷句點經過某個字時，用一條藍色豎線標示「放開會斷在這裡」，
+     不要整格變色——這樣才看得出來是卡在兩個字「中間」而不是選中那個字 */
+  .word-tok.dropTarget::before {
+    content: ''; position: absolute; left: -2px; top: -4px; bottom: -4px;
+    width: 3px; background: #4a90d9; border-radius: 2px;
+  }
+  /* 浮在字上方，用 JS 控制顯示（見下面 show-actions class），離開後
+     留 300ms 緩衝才收起來，不是純 CSS :hover——純 CSS :hover 的問題
+     是滑鼠從字移到上方按鈕的路上會先離開 word-tok 的範圍，中途 hover
+     狀態斷掉按鈕就先消失了，等於還沒到就已經按不到。留一點緩衝時間，
+     移動路徑上短暫離開範圍也不會馬上收起來。 */
+  .word-actions { position: absolute; top: -22px; left: 50%; transform: translateX(-50%); display: none; white-space: nowrap; gap: 3px; }
+  .word-tok.show-actions .word-actions { display: flex; }
+  .word-actions span { min-width: 20px; height: 20px; line-height: 20px; padding: 0 2px; font-size: 12px; text-align: center; border-radius: 4px; cursor: pointer; color: #fff; }
+  .word-del-btn { background: #d9453f; }
+  .word-split-btn { background: #4a90d9; }
+  /* 斷句點是獨立一叢控制項，前後都留白，讓它視覺上真的「卡在兩個字中間」，
+     不要跟文字黏在一起——這是使用者實測回報「按不到」之後的修正。 */
+  .seg-controls { display: inline-flex; align-items: center; gap: 6px; margin: 0 8px; vertical-align: middle; }
+  .boundary { position: relative; display: inline-flex; align-items: center; gap: 4px; color: #ff6d5a; font-weight: bold; font-size: 20px; cursor: grab; padding: 4px 8px; border-radius: 6px; }
+  .boundary:hover { background: #ffe9e5; }
+  /* 同上：浮在「/」上方，JS 控制 + 300ms 緩衝，不是純 CSS :hover。 */
+  .boundary .x {
+    display: none; position: absolute; top: -20px; left: 50%; transform: translateX(-50%);
+    width: 18px; height: 18px; line-height: 18px; font-size: 12px; font-weight: normal;
+    text-align: center; border-radius: 50%; background: #d9453f; color: #fff;
+  }
+  .boundary.show-x .x { display: flex; align-items: center; justify-content: center; }
+  .boundary:hover .x { display: inline-flex; }
+  .boundary.dragging { opacity: 0.4; }
+  .seg-star { cursor: pointer; color: #ccc; font-size: 20px; padding: 3px 5px; border-radius: 5px; }
+  .seg-star:hover { background: #f0f0f0; }
+  .seg-star.on { color: #ff6d5a; }
+  .seg-edit { cursor: pointer; color: #999; font-size: 14px; border: 1px solid #ddd; border-radius: 5px; padding: 3px 7px; background: #fff; }
+  .seg-edit:hover { background: #eee; }
+  .seg-edit:hover { background: #eee; }
+  .seg-whole-edit { display: inline-block; width: 92%; vertical-align: middle; font-family: inherit; font-size: 15px; border: 1px solid #ff6d5a; border-radius: 6px; padding: 4px 6px; margin: 2px 0; }
+  #wordsMissing { font-size: 13px; color: #666; }
+  #wordsMissing button { padding: 6px 12px; cursor: pointer; }
+  #wordsLog { white-space: pre-wrap; font-family: consolas, monospace; font-size: 11px; background: #111; color: #9f9; padding: 8px; border-radius: 6px; max-height: 140px; overflow-y: auto; display: none; margin-top: 8px; }
+  .applyRow { margin-top: 10px; display: flex; gap: 10px; align-items: center; }
+  .applyRow button { padding: 6px 14px; cursor: pointer; border-radius: 6px; border: none; background: #ff6d5a; color: #fff; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<header>
+  <strong>edit_state 編輯器</strong>
+  <select id="projectSelect"><option>載入中...</option></select>
+  <button id="saveBtn" disabled>存檔</button>
+  <button id="renderBtn" disabled>產生影片</button>
+  <span id="status"></span>
+</header>
+
+<main>
+  <div>
+    <section class="panel">
+      <h2>影片預覽</h2>
+      <p id="previewNote" style="font-size:12px;color:#666;margin:0 0 8px"></p>
+      <video id="preview" controls></video>
+      <div id="renderLog"></div>
+    </section>
+
+    <section class="panel">
+      <h2>排版 layout</h2>
+      <label class="field">畫面比例</label>
+      <select id="ratio">
+        <option value="9:16">9:16（直式短影音）</option>
+        <option value="16:9">16:9（橫式）</option>
+      </select>
+      <label class="field">背景顏色</label>
+      <div class="colorrow">
+        <input type="color" id="bgColor">
+        <input type="text" id="bgColorHex" placeholder="#1b1d29">
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>字卡內容</h2>
+      <label class="field">標題卡 · 第一句（白色）</label>
+      <input type="text" class="card" id="titleLine1">
+      <label class="field">標題卡 · 第二句（紅色，選填）</label>
+      <input type="text" class="card" id="titleLine2">
+      <label class="field">結尾卡文字（CTA）</label>
+      <textarea class="card" id="ctaText" rows="2"></textarea>
+    </section>
+
+  </div>
+
+  <section class="panel">
+    <h2>字幕（逐字編輯）</h2>
+    <div id="wordsMissing">
+      <p>這個 edit_state 的來源影片還沒有逐字時間戳，字幕編輯需要先對「這個檔案自己」轉錄一次
+      （不能借用建專案時對原始錄影做的那份，時間軸對不上）。</p>
+      <button id="genWordsBtn">產生逐字時間戳</button>
+      <div id="wordsLog"></div>
+    </div>
+    <div id="wordsReady" style="display:none">
+      <p style="font-size:12px;color:#666">
+        滑到字上會浮出：紅色×刪掉這個字（連影片/聲音一起剪掉）、藍色｜在這個字後面斷句拆成兩句。
+        紅色「/」是斷句點——<b>拖曳它放到任何一個字上可以移動斷句位置</b>，點旁邊的×可以整個刪掉（跟前一句合併）。
+        「/」旁邊的★設這句是不是金句，✎ 是整句重打（不用逐字改）。
+      </p>
+      <div id="wordStream"></div>
+      <div class="applyRow">
+        <button id="applyWordsBtn">套用到字幕／剪輯點</button>
+        <span id="applyStatus" style="font-size:13px;color:#666"></span>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+let currentState = null;
+let currentRelPath = null;
+
+async function loadProjectList() {
+  const res = await fetch('/api/states');
+  const list = await res.json();
+  const sel = document.getElementById('projectSelect');
+  sel.innerHTML = '<option value="">-- 選擇一個 edit_state --</option>' +
+    list.map(s => `<option value="${s.rel_path}">${s.project_dir} / ${s.filename}（${s.project_name}）</option>`).join('');
+}
+
+function loadLayoutAndCards() {
+  const layout = currentState.layout || {};
+  document.getElementById('ratio').value = layout.ratio || '9:16';
+  const bg = (layout.background && layout.background.color) || '#1b1d29';
+  document.getElementById('bgColor').value = bg;
+  document.getElementById('bgColorHex').value = bg;
+
+  // 標題卡文字用 \n 分兩行存在同一個 text 欄位（render.py 讀的格式沒變），
+  // 但 GUI 這邊拆成兩個獨立欄位比較好編輯，不用自己記得要打 \n。
+  const titleLines = ((currentState.title && currentState.title.text) || '').split('\n');
+  document.getElementById('titleLine1').value = titleLines[0] || '';
+  document.getElementById('titleLine2').value = titleLines[1] || '';
+  document.getElementById('ctaText').value = (currentState.cta && currentState.cta.text) || '';
+}
+
+document.getElementById('bgColor').addEventListener('input', (e) => {
+  document.getElementById('bgColorHex').value = e.target.value;
+});
+document.getElementById('bgColorHex').addEventListener('change', (e) => {
+  document.getElementById('bgColor').value = e.target.value;
+});
+
+function collectLayoutAndCards() {
+  if (!currentState.layout) currentState.layout = {};
+  currentState.layout.ratio = document.getElementById('ratio').value;
+  if (!currentState.layout.background) currentState.layout.background = {};
+  currentState.layout.background.color = document.getElementById('bgColorHex').value;
+
+  const line1 = document.getElementById('titleLine1').value.trim();
+  const line2 = document.getElementById('titleLine2').value.trim();
+  const titleText = line2 ? `${line1}\n${line2}` : line1;
+  if (titleText) {
+    if (!currentState.title) currentState.title = { size: 52, color: '#FFFFFF', color2: '#FF3B30', background: null };
+    currentState.title.text = titleText;
+  } else {
+    currentState.title = null;
+  }
+
+  const ctaText = document.getElementById('ctaText').value;
+  if (ctaText.trim()) {
+    if (!currentState.cta) currentState.cta = { size: 42, color: '#FFFFFF', background: '#FF6D5A' };
+    currentState.cta.text = ctaText;
+  } else {
+    currentState.cta = null;
+  }
+}
+
+async function loadPreview() {
+  // 這格永遠優先顯示「剪輯結果」（最新一次 render 過的成品），不是原始
+  // 素材——只有從沒 render 過、成品還不存在時才退回顯示原始來源當佔位。
+  // render.py 現在每次都另存新檔（時間戳記命名，不覆蓋舊版），所以不能
+  // 直接猜檔名，要問伺服器「這個專案最新一版是哪個檔案」。
+  const preview = document.getElementById('preview');
+  const note = document.getElementById('previewNote');
+  const res = await fetch('/api/latest_render/' + currentRelPath);
+  const data = await res.json();
+  if (data.exists) {
+    preview.onerror = null;
+    preview.src = '/media/' + data.output_rel.split('/').map(encodeURIComponent).join('/') + '?t=' + Date.now();
+    note.textContent = '';
+  } else {
+    preview.src = '/media/' + currentState.source.video_path.split('/').map(encodeURIComponent).join('/');
+    note.textContent = '（這個 edit_state 還沒產生過影片，先顯示原始素材當參考——按「產生影片」後這裡會換成真正的剪輯結果）';
+  }
+}
+
+document.getElementById('projectSelect').addEventListener('change', async (e) => {
+  const relPath = e.target.value;
+  if (!relPath) return;
+  const res = await fetch('/api/state/' + relPath);
+  const data = await res.json();
+  currentState = data.state;
+  currentRelPath = relPath;
+  loadPreview();
+  loadLayoutAndCards();
+  document.getElementById('saveBtn').disabled = false;
+  document.getElementById('renderBtn').disabled = false;
+  document.getElementById('renderLog').style.display = 'none';
+  wordState = null;
+  document.getElementById('wordsReady').style.display = 'none';
+  document.getElementById('wordsMissing').style.display = 'block';
+  document.getElementById('wordsLog').style.display = 'none';
+  loadWords();
+});
+
+document.getElementById('saveBtn').addEventListener('click', async () => {
+  collectLayoutAndCards();
+  const status = document.getElementById('status');
+  status.textContent = '存檔中...';
+  const res = await fetch('/api/state/' + currentRelPath, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(currentState),
+  });
+  status.textContent = res.ok ? '已存檔' : '存檔失敗';
+  setTimeout(() => status.textContent = '', 2000);
+});
+
+document.getElementById('renderBtn').addEventListener('click', async () => {
+  collectLayoutAndCards();
+  await fetch('/api/state/' + currentRelPath, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(currentState),
+  });
+  const log = document.getElementById('renderLog');
+  log.style.display = 'block';
+  log.textContent = '啟動 render.py...';
+  const res = await fetch('/api/render/' + currentRelPath, { method: 'POST' });
+  const { job_id } = await res.json();
+  const status = document.getElementById('status');
+  status.textContent = '產生中...';
+
+  const poll = setInterval(async () => {
+    const r = await fetch('/api/render_status/' + job_id);
+    const job = await r.json();
+    log.textContent = job.log || '（等待輸出...）';
+    log.scrollTop = log.scrollHeight;
+    if (job.status === 'done' || job.status === 'error') {
+      clearInterval(poll);
+      status.textContent = job.status === 'done' ? '完成' : '失敗';
+      if (job.status === 'done' && job.output_rel) {
+        const preview = document.getElementById('preview');
+        preview.onerror = null;
+        preview.src = '/media/' + job.output_rel.split('/').map(encodeURIComponent).join('/') + '?t=' + Date.now();
+        document.getElementById('previewNote').textContent = '';
+      }
+    }
+  }, 2000);
+});
+
+// ---------- 字幕編輯（逐字為唯一資料來源） ----------
+let wordState = null; // [{word,start,end,deleted}]
+let boundarySet = null; // Set<number> —— word 索引，代表「這個字是新一句的開頭」
+let emphasisMap = null; // {index: bool}
+let dragBoundaryIndex = null; // 目前正在拖曳中的斷句點（word 索引）
+
+// deleted：使用者按 × 剪掉（連影片一起剪）。merged：被「整段編輯」收進
+// 別的 token 裡，文字上不再單獨顯示，但影片沒有被剪掉。兩者都代表這個
+// word 不會再被當成獨立顯示單位。
+function isActive(w) { return !w.deleted && !w.merged; }
+
+async function loadWords() {
+  const res = await fetch('/api/words/' + currentRelPath);
+  const data = await res.json();
+  document.getElementById('wordsMissing').style.display = data.exists ? 'none' : 'block';
+  document.getElementById('wordsReady').style.display = data.exists ? 'block' : 'none';
+  if (data.exists) initWordState(data.words);
+}
+
+document.getElementById('genWordsBtn').addEventListener('click', async () => {
+  const log = document.getElementById('wordsLog');
+  log.style.display = 'block';
+  log.textContent = '啟動轉錄...';
+  const res = await fetch('/api/words/' + currentRelPath, { method: 'POST' });
+  const { job_id } = await res.json();
+  const poll = setInterval(async () => {
+    const r = await fetch('/api/render_status/' + job_id);
+    const job = await r.json();
+    log.textContent = job.log || '（等待輸出...）';
+    log.scrollTop = log.scrollHeight;
+    if (job.status === 'done' || job.status === 'error') {
+      clearInterval(poll);
+      if (job.status === 'done') { loadWords(); } else { log.textContent += '\n（失敗，請檢查 API key / ffmpeg 設定）'; }
+    }
+  }, 2000);
+});
+
+// subtitles[]/broll[] 的時間是「剪完拼接後」的時間軸，逐字稿的時間是
+// 「原始來源影片」的時間軸——只有 clips[] 剛好是單一一段從頭到尾都留著
+// 的情況（例如教育版）兩者才會恰好一樣。行銷短影音這種從一支長影片挑
+// 好幾段不連續片段的專案，兩個時間軸差很多（例如剪完只有 47 秒，但
+// 逐字稿是整支 17 分鐘），直接拿字幕的時間去逐字稿裡找最接近的字，會
+// 全部對到影片最前面去。這裡先把字幕時間換算回「原始影片」的時間，
+// 再去逐字稿裡比對，才會對到真正對應的那個字。
+function keptTimeToSourceTime(keptT, clips) {
+  const kept = (clips || []).filter(c => c.keep);
+  let acc = 0;
+  for (let idx = 0; idx < kept.length; idx++) {
+    const c = kept[idx];
+    const dur = c.end - c.start;
+    const isLast = idx === kept.length - 1;
+    // 剛好卡在兩段交界的時間點，要算成「下一段的開頭」，不是「上一段
+    // 的結尾」——不然像 clip5 結尾同時也是 clip6 開頭這種情況，字幕
+    // 時間點會被誤判成落在 clip5 尾巴，對應錯字。只有最後一段才需要
+    // 用 <=（把整支影片的結尾時間也含進去）。
+    // EPS：acc 是好幾段長度累加出來的，浮點數誤差會讓理論上剛好相等
+    // 的邊界值變成「差了 1e-14 那種等級」，光用 < 不夠，要留一點容許
+    // 誤差才不會被這種誤差騙去判到前一段。
+    const EPS = 1e-6;
+    if (isLast ? keptT <= acc + dur + EPS : keptT < acc + dur - EPS) return c.start + (keptT - acc);
+    acc += dur;
+  }
+  return kept.length ? kept[kept.length - 1].end : keptT;
+}
+
+function initWordState(words) {
+  wordState = words.map(w => ({ word: w.word, start: w.start, end: w.end, deleted: false }));
+  boundarySet = new Set([0]);
+  emphasisMap = {};
+  const subs = currentState.subtitles || [];
+  const clips = currentState.clips || [];
+  const EPS = 0.02;
+
+  // 斷句點初始化：subtitles[] 如果有 source_start（上次「套用」時算好、
+  // 直接來自逐字時間戳的精確來源時間，不是猜的），就直接找「第一個
+  // start >= source_start」的字當斷句起點，100% 精確，不會抓偏。
+  // 沒有這個欄位的（例如還沒套用過、AI 第一次手寫的舊資料）才退回用
+  // 「剪完後時間換算回原始時間、找最接近的字」這種猜測法——這正是之前
+  // 「刪除範圍少算一個字」的成因：猜測法在字跟字時間很接近時會抓錯
+  // 邊界。只要走過一次套用，這個專案往後就會一直有精確欄位可用，不用
+  // 再猜。
+  subs.forEach(sub => {
+    let startI;
+    if (sub.source_start != null) {
+      startI = wordState.findIndex(w => w.start >= sub.source_start - EPS);
+      if (startI === -1) startI = 0;
+    } else {
+      const srcT = keptTimeToSourceTime(sub.start, clips);
+      let bestI = 0, bestDiff = Infinity;
+      wordState.forEach((w, i) => {
+        const diff = Math.abs(w.start - srcT);
+        if (diff < bestDiff) { bestDiff = diff; bestI = i; }
+      });
+      startI = bestI;
+    }
+    boundarySet.add(startI);
+    if (sub.emphasis) emphasisMap[startI] = true;
+  });
+
+  // 原始逐字稿是 ASR 直出的，可能還帶著同音字錯誤，但 subtitles[]
+  // 裡的文字才是實際存檔、燒進影片的版本（可能已經被人工校正過，
+  // 校正常常會改變字數，例如「保險衣服」→「保險業務員」，或是被
+  // 手動斷成兩行帶 \n）。
+  //
+  // 時間格（每個 ASR token 的起訖時間）永遠維持原本切的樣子，不因為
+  // 文字校正而合併或改變——時間是量出來的，跟裡面該顯示什麼文字是
+  // 兩件事。字數剛好對得上時直接字元對字元套回逐字 token；字數對不上
+  // 時，用前綴／後綴比對找出「其實沒被改到」的格子（維持原樣、時間
+  // 不動），只把真正被改動、兜不起來的中間那段文字，整包放進中間
+  // 第一格（其餘中間格清空，但格子本身、時間都保留，還是能個別
+  // 刪除／斷句）。
+  const boundaries = Array.from(boundarySet).sort((a, b) => a - b);
+  boundaries.forEach((startI, idx) => {
+    const endI = idx + 1 < boundaries.length ? boundaries[idx + 1] : wordState.length;
+    const cardWords = [];
+    for (let i = startI; i < endI; i++) if (isActive(wordState[i])) cardWords.push(i);
+    if (!cardWords.length) return;
+    const raw = cardWords.map(i => wordState[i].word).join('');
+    // 找對應的 subtitle：有 source_start 的話直接精確比對這個 card 的
+    // 起點字時間，不用再猜；沒有才退回舊的「時間最接近」比對法。
+    let best = subs.find(s => s.source_start != null && Math.abs(s.source_start - wordState[startI].start) < EPS);
+    if (!best) {
+      let bestDiff = Infinity;
+      subs.forEach(sub => {
+        const diff = Math.abs(wordState[startI].start - keptTimeToSourceTime(sub.start, clips));
+        if (diff < bestDiff) { bestDiff = diff; best = sub; }
+      });
+    }
+    if (!best) return;
+    if (best.text.length === raw.length) {
+      let pos = 0;
+      cardWords.forEach(i => {
+        const len = wordState[i].word.length;
+        wordState[i].word = best.text.slice(pos, pos + len);
+        pos += len;
+      });
+    } else if (best.text.replace(/\n/g, '') !== raw) {
+      // 字數對不上、內容也不只是差在有沒有斷行——代表被人工改過文字。
+      // 不整段合併（那樣會犧牲逐字可刪/可斷句的時間格粒度），而是用
+      // 前綴／後綴比對，把「沒被改到」的格子維持原樣、時間不動，只有
+      // 真正兜不起來的中間那段才需要重新分配文字。
+      const target = best.text.replace(/\n/g, '');
+      let lo = 0, pos = 0;
+      while (lo < cardWords.length) {
+        const w = wordState[cardWords[lo]].word;
+        if (target.slice(pos, pos + w.length) === w) { pos += w.length; lo++; }
+        else break;
+      }
+      // hi 最多只能縮到 lo+1（保留至少一格當「中間收尾格」）——不能讓
+      // 後綴比對一路吃到跟前綴比對同一格，不然那一格會同時被前綴判定
+      // 「沒對上」又被後綴判定「單獨對上」，兩邊各自處理會讓剩餘文字
+      // 沒地方放，退到下面的補救分支時用 += 硬接上去，結果變成文字
+      // 順序被打亂（曾經在「都是公司的客戶資料」這句實際重現過：因為
+      // 這一格原文剛好跟目標文字中間某個字重複，被後綴比對誤判成對上
+      // 了）。
+      let hi = cardWords.length, tailPos = target.length;
+      while (hi > lo + 1) {
+        const w = wordState[cardWords[hi - 1]].word;
+        if (target.slice(tailPos - w.length, tailPos) === w) { tailPos -= w.length; hi--; }
+        else break;
+      }
+      if (lo < hi) {
+        wordState[cardWords[lo]].word = target.slice(pos, tailPos);
+        for (let k = lo + 1; k < hi; k++) wordState[cardWords[k]].word = '';
+      } else if (pos < tailPos) {
+        // 理論上不會發生（前後綴只在完全比對時才前進），保險起見避免
+        // 剩餘文字憑空消失。
+        wordState[cardWords[Math.max(lo - 1, 0)]].word += target.slice(pos, tailPos);
+      }
+    }
+    // 其餘情況（純粹只差在 \n 斷行，內容本身一樣）維持逐字顯示，
+    // 不用特別處理。
+  });
+
+  renderWordStream();
+}
+
+function cardRanges() {
+  const boundaries = Array.from(boundarySet).sort((a, b) => a - b);
+  return boundaries.map((startI, idx) => ({
+    startI,
+    endI: idx + 1 < boundaries.length ? boundaries[idx + 1] : wordState.length,
+  }));
+}
+
+function makeWordTok(i) {
+  const w = wordState[i];
+  const tok = document.createElement('span');
+  tok.className = 'word-tok';
+  tok.contentEditable = 'true';
+  tok.dataset.i = i;
+  tok.appendChild(document.createTextNode(w.word));
+
+  const actions = document.createElement('span');
+  actions.className = 'word-actions';
+  actions.contentEditable = 'false';
+  const delBtn = document.createElement('span');
+  delBtn.className = 'word-del-btn';
+  delBtn.textContent = '×';
+  delBtn.dataset.i = i;
+  delBtn.dataset.act = 'del';
+  delBtn.title = '刪除這個字（連影片一起剪掉）';
+  const splitBtn = document.createElement('span');
+  splitBtn.className = 'word-split-btn';
+  splitBtn.textContent = '｜';
+  splitBtn.dataset.i = i;
+  splitBtn.dataset.act = 'split';
+  splitBtn.title = '在這個字後面斷句';
+  actions.appendChild(delBtn);
+  actions.appendChild(splitBtn);
+  tok.appendChild(actions);
+  return tok;
+}
+
+// 連續一整段文字流（貼近參考圖的樣式），斷句點是行內的「/」，不分格子/卡片
+function renderWordStream() {
+  const el = document.getElementById('wordStream');
+  el.innerHTML = '';
+  let firstSeg = true;
+  cardRanges().forEach(({ startI, endI }) => {
+    const idxs = [];
+    for (let i = startI; i < endI; i++) if (isActive(wordState[i])) idxs.push(i);
+    if (!idxs.length) return;
+
+    const controls = document.createElement('span');
+    controls.className = 'seg-controls';
+
+    if (!firstSeg) {
+      const handle = document.createElement('span');
+      handle.className = 'boundary';
+      handle.draggable = true;
+      handle.dataset.i = startI;
+      handle.title = '拖曳移動斷句點';
+      handle.innerHTML = '/<span class="x" data-i="' + startI + '" data-act="unsplit" title="刪除這個斷句點（跟前一句合併）">×</span>';
+      controls.appendChild(handle);
+    }
+
+    const star = document.createElement('span');
+    star.className = 'seg-star' + (emphasisMap[startI] ? ' on' : '');
+    star.textContent = '★';
+    star.dataset.i = startI;
+    star.dataset.act = 'star';
+    star.title = '設為金句';
+    controls.appendChild(star);
+
+    const editBtn = document.createElement('span');
+    editBtn.className = 'seg-edit';
+    editBtn.textContent = '✎';
+    editBtn.dataset.i = startI;
+    editBtn.dataset.act = 'wholeedit';
+    editBtn.title = '整句重打';
+    controls.appendChild(editBtn);
+
+    el.appendChild(controls);
+
+    idxs.forEach(i => {
+      const tok = makeWordTok(i);
+      if (emphasisMap[startI]) tok.classList.add('emph-word');
+      el.appendChild(tok);
+    });
+    firstSeg = false;
+  });
+}
+
+// 浮動按鈕的顯示/隱藏：離開範圍後留 300ms 緩衝才收起來，滑鼠移動路徑上
+// 短暫離開 word-tok/boundary 的範圍（例如往上移去點浮在上面的按鈕）
+// 不會馬上被 CSS :hover 斷開而消失。
+let hideActionsTimer = null;
+function showHoverTarget(el) {
+  clearTimeout(hideActionsTimer);
+  document.querySelectorAll('.word-tok.show-actions').forEach(t => { if (t !== el) t.classList.remove('show-actions'); });
+  document.querySelectorAll('.boundary.show-x').forEach(t => { if (t !== el) t.classList.remove('show-x'); });
+  if (el.classList.contains('word-tok')) el.classList.add('show-actions');
+  if (el.classList.contains('boundary')) el.classList.add('show-x');
+}
+function scheduleHideHoverTargets() {
+  clearTimeout(hideActionsTimer);
+  hideActionsTimer = setTimeout(() => {
+    document.querySelectorAll('.word-tok.show-actions').forEach(t => t.classList.remove('show-actions'));
+    document.querySelectorAll('.boundary.show-x').forEach(t => t.classList.remove('show-x'));
+  }, 300);
+}
+document.getElementById('wordStream').addEventListener('mouseover', (e) => {
+  const el = e.target.closest('.word-tok, .boundary');
+  if (el) showHoverTarget(el);
+});
+document.getElementById('wordStream').addEventListener('mouseout', (e) => {
+  const from = e.target.closest('.word-tok, .boundary');
+  const to = e.relatedTarget && e.relatedTarget.closest ? e.relatedTarget.closest('.word-tok, .boundary') : null;
+  if (from && to !== from) scheduleHideHoverTargets();
+});
+
+document.getElementById('wordStream').addEventListener('click', (e) => {
+  const act = e.target.dataset.act;
+  if (!act) return;
+  const i = parseInt(e.target.dataset.i, 10);
+  if (act === 'del') {
+    wordState[i].deleted = true;
+    if (boundarySet.has(i)) {
+      boundarySet.delete(i);
+      for (let j = i + 1; j < wordState.length; j++) {
+        if (isActive(wordState[j])) { boundarySet.add(j); break; }
+      }
+    }
+  } else if (act === 'split') {
+    for (let j = i + 1; j < wordState.length; j++) {
+      if (isActive(wordState[j])) { boundarySet.add(j); break; }
+    }
+  } else if (act === 'unsplit') {
+    boundarySet.delete(i);
+  } else if (act === 'star') {
+    emphasisMap[i] = !emphasisMap[i];
+  } else if (act === 'wholeedit') {
+    startWholeCardEdit(i);
+    return;
+  } else {
+    return;
+  }
+  renderWordStream();
+});
+
+// 斷句點「/」拖曳：拖到哪個字上，斷句點就移到那個字前面
+document.getElementById('wordStream').addEventListener('dragstart', (e) => {
+  if (!e.target.classList.contains('boundary')) return;
+  dragBoundaryIndex = parseInt(e.target.dataset.i, 10);
+  e.target.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+});
+
+document.getElementById('wordStream').addEventListener('dragend', (e) => {
+  if (e.target.classList.contains('boundary')) e.target.classList.remove('dragging');
+});
+
+document.getElementById('wordStream').addEventListener('dragover', (e) => {
+  const tok = e.target.closest('.word-tok');
+  if (!tok || dragBoundaryIndex === null) return;
+  e.preventDefault();
+  tok.classList.add('dropTarget');
+});
+
+document.getElementById('wordStream').addEventListener('dragleave', (e) => {
+  const tok = e.target.closest('.word-tok');
+  if (tok) tok.classList.remove('dropTarget');
+});
+
+document.getElementById('wordStream').addEventListener('drop', (e) => {
+  const tok = e.target.closest('.word-tok');
+  if (!tok || dragBoundaryIndex === null) return;
+  e.preventDefault();
+  tok.classList.remove('dropTarget');
+  const dropI = parseInt(tok.dataset.i, 10);
+  if (dropI !== 0 && dropI !== dragBoundaryIndex) {
+    boundarySet.delete(dragBoundaryIndex);
+    boundarySet.add(dropI);
+  }
+  dragBoundaryIndex = null;
+  renderWordStream();
+});
+
+document.getElementById('wordStream').addEventListener('blur', (e) => {
+  if (!e.target.classList || !e.target.classList.contains('word-tok')) return;
+  const i = parseInt(e.target.dataset.i, 10);
+  // contenteditable 的內容可能還包含刪除/斷句按鈕的殘留文字節點，只取文字節點本身
+  let text = '';
+  e.target.childNodes.forEach(n => { if (n.nodeType === Node.TEXT_NODE) text += n.textContent; });
+  wordState[i].word = text.trim();
+}, true);
+
+// 整句重打：把這段的所有字 token 換成一個 textarea，收起來時把這段字
+// 全部收斂成「一個字」（時間戳用這句原本的 start/end），不用逐字對應
+function startWholeCardEdit(startI) {
+  const { endI } = cardRanges().find(r => r.startI === startI);
+  const idxs = [];
+  for (let i = startI; i < endI; i++) if (isActive(wordState[i])) idxs.push(i);
+  if (!idxs.length) return;
+  const text = idxs.map(i => wordState[i].word).join('');
+  const start = wordState[idxs[0]].start;
+  const end = wordState[idxs[idxs.length - 1]].end;
+
+  const toks = idxs.map(i => document.querySelector(`.word-tok[data-i="${i}"]`)).filter(Boolean);
+  if (!toks.length) return;
+  const ta = document.createElement('textarea');
+  ta.className = 'seg-whole-edit';
+  ta.value = text;
+  ta.rows = 1;
+  toks[0].replaceWith(ta);
+  toks.slice(1).forEach(t => t.remove());
+  ta.focus();
+
+  const commit = () => {
+    const newText = ta.value.trim();
+    // 把這句所有字收斂成一個 word token（用整句起訖時間），中間的字全部標刪除
+    wordState[idxs[0]].word = newText;
+    wordState[idxs[0]].start = start;
+    wordState[idxs[0]].end = end;
+    for (let k = 1; k < idxs.length; k++) {
+      // 注意：這裡是 merged 不是 deleted——這些字只是被收進整段編輯的
+      // 文字裡不再單獨顯示，對應的影片/聲音還在，不能當成使用者按 ×
+      // 剪掉處理，不然套用時會把這整段話從影片裡剪掉。
+      wordState[idxs[k]].merged = true;
+      boundarySet.delete(idxs[k]);
+    }
+    renderWordStream();
+  };
+  ta.addEventListener('blur', commit);
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ta.blur(); }
+  });
+}
+
+document.getElementById('applyWordsBtn').addEventListener('click', async () => {
+  const status = document.getElementById('applyStatus');
+  status.textContent = '套用中...';
+  const res = await fetch('/api/apply_word_edits/' + currentRelPath, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      words: wordState,
+      boundaries: Array.from(boundarySet),
+      emphasis: emphasisMap,
+      clips: currentState.clips,
+      broll: currentState.broll || [],
+    }),
+  });
+  if (!res.ok) { status.textContent = '套用失敗'; return; }
+  const result = await res.json();
+  currentState.clips = result.clips;
+  currentState.subtitles = result.subtitles;
+  currentState.broll = result.broll;
+  status.textContent = `已套用（${result.subtitles.length} 句字幕、${result.clips.filter(c=>!c.keep).length} 段剪掉）— 記得按上面「存檔」才會寫回檔案`;
+});
+
+loadProjectList();
+</script>
+</body>
+</html>

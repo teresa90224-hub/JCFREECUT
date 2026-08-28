@@ -1,0 +1,13 @@
+# 必要：caption_editor 網頁編輯器要用
+flask
+
+# 必要（三選一）：轉字幕至少要有一種方式可用
+# 1. Groq API（最快，需要 GROQ_API_KEY，見 README「API Key 怎麼設定」）
+groq
+# 2. 本機 CPU 轉錄（沒有 GROQ_API_KEY 時的預設 fallback）
+faster-whisper
+# 3. openai-whisper CLI 是最後備援，不透過 pip 這個檔案安裝，
+#    需要另外執行：pip install -U openai-whisper
+
+# 建議：把簡體輸出轉繁體（沒裝也不會擋住轉錄，只是字幕會是簡體）
+opencc-python-reimplemented

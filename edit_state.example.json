@@ -1,0 +1,78 @@
+{
+  "project_name": "範例專案",
+  "template": "talking_head_3zone",
+  "topic": "範例主題句",
+  "status": "draft",
+  "source": {
+    "video_path": "04_cuts/segment_cut.mp4",
+    "duration_sec": 111.6
+  },
+  "clips": [
+    {
+      "start": 0.0,
+      "end": 4.2,
+      "keep": false,
+      "reason": "開場停頓，或不在精華範圍內"
+    },
+    {
+      "start": 4.2,
+      "end": 12.5,
+      "keep": true,
+      "reason": "第一個重點：問題/痛點"
+    },
+    {
+      "start": 40.0,
+      "end": 52.0,
+      "keep": true,
+      "reason": "第二個重點：可以不連續，接著上一段拼起來"
+    }
+  ],
+  "title": {
+    "text": "第一句話\n第二句話（用 \\n 分行，可以分開上色）",
+    "size": 62,
+    "color": "#FFFFFF",
+    "color2": "#FF3B30",
+    "background": null
+  },
+  "subtitles": [
+    {
+      "text": "一般句子的範例\n可以分兩行",
+      "start": 4.2,
+      "end": 8.5,
+      "emphasis": false
+    },
+    {
+      "text": "這句是金句\n會放大變色",
+      "start": 8.5,
+      "end": 12.0,
+      "emphasis": true
+    }
+  ],
+  "subtitle_style": {
+    "size": 56,
+    "emphasis_size": 68,
+    "color": "#FFFFFF",
+    "emphasis_color": "#FF3B30",
+    "outline_color": "#000000",
+    "outline_width": 5,
+    "shadow": 0,
+    "ass_font_family": "Microsoft JhengHei Bold"
+  },
+  "broll": [],
+  "layout": {
+    "ratio": "9:16",
+    "background": {
+      "color": "#1b1d29"
+    }
+  },
+  "music": {
+    "asset": null,
+    "volume": 0.15
+  },
+  "cta": {
+    "text": "CTA文字",
+    "size": 42,
+    "color": "#FFFFFF",
+    "background": "#FF6D5A"
+  }
+}
