@@ -9,20 +9,31 @@
 `edit_state.json`，`render.py` 照著執行——所以同一份 `edit_state.json` 不管是 AI
 第一次生成、還是之後手動調整過，呼叫 `render.py` 都會得到一致的結果。
 
-## 快速上手
+## 快速上手（Windows）
 
-1. **裝環境需求**（見下方「環境需求」）：ffmpeg、ImageMagick、auto-editor，
-   Python 套件跑 `pip install -r requirements.txt`。
-2. **申請 API key**（見下方「API Key 怎麼設定」）：至少要有 `GROQ_API_KEY`
-   才能用最快的雲端轉字幕；要抓 B-roll 的話再另外申請 `PEXELS_API_KEY`。
-   兩把 key 都用 `setx` 設成系統環境變數，**不要**貼在對話或程式碼裡。
-3. **clone 這個 repo**，用 [Claude Code](https://claude.com/claude-code)
-   在這個資料夾底下開一個對話，跟它說「幫我剪這支影片」並附上影片路徑
-   ——`.claude/skills/short-video-cut/` 裡的技能檔會自動被載入，Claude
-   接下來會照著技能檔的流程幫你問清楚需求、轉字幕、判斷剪輯點、出片。
-4. 也可以不透過 Claude，直接手動跑：見下方「標準流程」的三行指令。
-5. 出片之後想手動微調字幕/標題，開 `python caption_editor/server.py`，
+**最簡單的方式：下載這個 repo（Code → Download ZIP，或 `git clone`）解壓縮後，
+直接雙擊執行 `setup.bat`**——會自動幫你：
+
+1. 檢查 Python、跑 `pip install -r requirements.txt` 裝好套件
+2. 檢查 ffmpeg／ImageMagick，沒有的話用 winget 自動安裝（電腦上沒有 winget
+   的話會提示你手動下載連結）
+3. 引導你貼上 Groq（必要，轉字幕用）跟 Pexels（選用，抓 B-roll 用）的
+   免費 API key，自動用 `setx` 設成系統環境變數——**這一步只會存在你自己
+   電腦的環境變數裡，不會傳到任何地方，也不會進到這個 repo**
+
+跑完 `setup.bat` 之後：
+
+1. **重新開一個新的終端機視窗**（環境變數要重開才會生效）
+2. 用 [Claude Code](https://claude.com/claude-code) 在這個資料夾底下開一個
+   對話，跟它說「幫我剪這支影片」並附上影片路徑——`.claude/skills/
+   short-video-cut/` 裡的技能檔會自動被載入，Claude 接下來會照著技能檔的
+   流程幫你問清楚需求、轉字幕、判斷剪輯點、出片。
+3. 也可以不透過 Claude，直接手動跑：見下方「標準流程」的三行指令。
+4. 出片之後想手動微調字幕/標題，開 `python caption_editor/server.py`，
    瀏覽器打開 http://localhost:8770。
+
+沒有要用 `setup.bat`、想自己手動裝的話，照下面「環境需求」跟
+「API Key 怎麼設定」自己一步步來也可以。
 
 ## 環境需求
 
