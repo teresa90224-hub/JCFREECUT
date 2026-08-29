@@ -161,7 +161,11 @@ def verify(edit_state_path: Path) -> int:
         real_start = char_times[idx]
         drift = declared_start - real_start
         if abs(drift) > DRIFT_WARN_SEC:
-            direction = "偷跑（字幕比語音早出現）" if drift > 0 else "延遲（字幕比語音晚出現）"
+            # drift = 宣稱時間 - 真實時間。drift>0 代表宣稱的時間點比真實
+            # 語音晚，也就是字幕會等到語音講完一陣子才跳出來（延遲）；
+            # drift<0 代表宣稱的時間點比真實語音早，字幕會搶在語音講出來
+            # 之前就跳出來（偷跑）——這裡曾經寫反過，測試時人工核對才抓到。
+            direction = "延遲（字幕比語音晚出現）" if drift > 0 else "偷跑（字幕比語音早出現）"
             problems.append({
                 "text": text, "declared_start": declared_start, "real_start": round(real_start, 2),
                 "issue": f"{direction} {abs(drift):.2f} 秒，超過 {DRIFT_WARN_SEC} 秒門檻。",
