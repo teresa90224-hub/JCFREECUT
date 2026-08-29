@@ -74,9 +74,15 @@ python new_project.py "path/to/原始影片.mp4" --name "專案名稱"
 
 # 3. 依 edit_state.json 產生最終影片
 python render.py "projects/專案名稱/06_meta/edit_state.json"
+
+# 4. 出片後驗證字幕有沒有跟語音對不上（需要 GROQ_API_KEY）
+python verify_render.py "projects/專案名稱/06_meta/edit_state.json"
 ```
 
-輸出在 `projects/<專案名稱>/05_render/`。
+輸出在 `projects/<專案名稱>/05_render/`。`verify_render.py` 會把最新那支
+成品重新轉錄一次，拿實際聽得到的逐字時間去跟 `subtitles[]` 宣稱的時間
+比對，超過 0.4 秒差距就列出來——每次出片後都建議跑一次，比人工聽過
+一遍更容易抓到不明顯的偷跑/搶拍。
 
 ### 轉錄後的人工校對
 

@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""
+verify_render.py
+-----------------
+出片後的字幕同步自動驗證：把渲染好的成品重新轉錄一次，拿「真正聽得到」
+的逐字時間戳，去跟 edit_state.json 裡宣稱的 subtitles[] start/end 比對，
+超過門檻的差距就印出來。
+
+背景（別再犯這個坑）：這支工具的原始逐字稿／.words.json 偶爾會在局部
+出現時間戳損壞——可能是一個詞被標了異常長的時間（吃掉了好幾秒的其他
+內容），也可能是兩個詞的時間戳互相重疊（後一個詞的 start 比前一個詞的
+end 還早）。這種損壞單靠人工檢查很容易漏掉，寫進 edit_state.json 的
+subtitles[] 就會出現「字幕比語音早跳出來」的偷跑現象。SKILL.md 裡雖然
+教了怎麼判斷剪輯點時預先檢查，但那是「判斷層」的人工紀律，本身不會
+自動執行——這支腳本才是真正的機械化安全網：出片後一定要跑一次，
+不是「建議跑」，是流程的必要步驟（見 SKILL.md 第 5.5 步）。
+
+用法：
+    python verify_render.py "projects/<專案名稱>/06_meta/edit_state.json"
+
+會自動找 05_render/ 底下最新的一支成品來驗證。需要 GROQ_API_KEY
+（沒有設定的話會直接跳過驗證並印出提醒，不會擋住其他流程）。
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+from av_tools import log
+
+DRIFT_WARN_SEC = 0.4
+MATCH_PREFIX_LEN = 3
+
+
+def _latest_render(project_dir: Path) -> Path | None:
+    render_dir = project_dir / "05_render"
+    candidates = sorted(render_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+    return candidates[-1] if candidates else None
+
+
+def _transcribe_words(groq_client, media_path: Path) -> list[dict]:
+    with media_path.open("rb") as f:
+        resp = groq_client.audio.transcriptions.create(
+            file=f,
+            model="whisper-large-v3-turbo",
+            response_format="verbose_json",
+            language="zh",
+            timestamp_granularities=["word"],
+        )
+    words = getattr(resp, "words", None) or []
+    # groq SDK 回傳的 words 有時是物件（.word/.start/.end），有時是
+    # dict（["word"]/["start"]/["end"]），視版本而定，兩種都要能吃。
+    def _get(w, key):
+        return w[key] if isinstance(w, dict) else getattr(w, key)
+
+    # Whisper/Groq 的中文輸出預設是簡體字，但 edit_state.json 裡的
+    # subtitles[] 文字是繁體（new_project.py 產生逐字稿時已經用 opencc
+    # 轉過）。這裡沒轉的話，繁簡不同字形會讓後面的子字串比對整批找不到
+    # （踩過這個坑：第一次跑測試 189 個詞裡 16 句字幕都被誤判成「找不到」，
+    # 其實內容完全正確，純粹是簡繁不同字形比對不到）。
+    try:
+        from opencc import OpenCC
+        cc = OpenCC("s2twp")
+    except ImportError:
+        cc = None
+
+    result = [{"word": _get(w, "word"), "start": _get(w, "start"), "end": _get(w, "end")} for w in words]
+    if cc:
+        for w in result:
+            w["word"] = cc.convert(w["word"])
+    return result
+
+
+def _flatten_words_to_text_index(words: list[dict]) -> tuple[str, list[float]]:
+    """
+    把逐字詞流接成一整串純文字，同時記錄「文字裡每個字元對應到的真實
+    開始時間」，讓後面可以用 subtitles[] 的文字內容去做子字串比對、
+    直接查出那段文字實際被念出來的時間，不用自己另外寫對齊演算法。
+    """
+    text_chars = []
+    char_times = []
+    for w in words:
+        word_text = w["word"]
+        # 一個詞可能有好幾個字元，時間戳只有整個詞的起訖，這裡簡單假設
+        # 詞內每個字元平均分攤時間（對抓「這段文字大概何時開始」已經
+        # 夠精準，不需要逐字元精確時間）。
+        n = max(len(word_text), 1)
+        span = (w["end"] - w["start"]) / n
+        for i, ch in enumerate(word_text):
+            text_chars.append(ch)
+            char_times.append(w["start"] + i * span)
+    return "".join(text_chars), char_times
+
+
+def verify(edit_state_path: Path) -> int:
+    project_dir = edit_state_path.parent.parent
+    with edit_state_path.open(encoding="utf-8") as f:
+        state = json.load(f)
+
+    subtitles = state.get("subtitles", [])
+    if not subtitles:
+        log("edit_state.json 沒有 subtitles[]，跳過驗證。")
+        return 0
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        log("[提醒] 沒有設定 GROQ_API_KEY，無法自動驗證字幕跟語音是否同步。")
+        log("       出片前建議先設定好再跑一次這支腳本，不要跳過驗證直接交付。")
+        return 1
+
+    try:
+        from groq import Groq
+    except ImportError:
+        log("[提醒] 沒有安裝 groq 套件（pip install groq），無法自動驗證，跳過。")
+        return 1
+
+    render_path = _latest_render(project_dir)
+    if not render_path:
+        log(f"在 {project_dir / '05_render'} 找不到任何成品，先跑 render.py。")
+        return 1
+
+    log(f"重新轉錄成品做字幕同步驗證：{render_path.name} ...")
+    client = Groq(api_key=api_key)
+    words = _transcribe_words(client, render_path)
+    if not words:
+        log("[警告] 重新轉錄沒有拿到任何逐字時間戳，無法驗證，請人工聽過確認。")
+        return 1
+
+    full_text, char_times = _flatten_words_to_text_index(words)
+
+    problems = []
+    search_from = 0  # 字幕跟語音都是照時間順序排列，比對游標只往前走，
+    # 不要每次都從頭找——不然像「然後」「我們」這種常見詞在全片裡出現
+    # 好幾次，從頭找永遠只會抓到「最早出現的那一次」，跟這句字幕實際
+    # 對應的那次完全無關，會製造出一堆假的「偷跑」警告
+    # （實測踩過：第一版沒設游標，8 句完全正常的字幕被誤判成偷跑
+    # 0.7-1.3 秒，其實只是抓到前面某句話裡同樣開頭字的舊位置）。
+    for sub in subtitles:
+        text = sub.get("text", "").replace("\n", "")
+        declared_start = sub.get("start")
+        if not text or declared_start is None:
+            continue
+        prefix = text[:MATCH_PREFIX_LEN]
+        idx = full_text.find(prefix, search_from)
+        if idx == -1:
+            # 游標後面找不到，可能是游標卡住了（例如上一句誤判），
+            # 放寬成整篇搜尋再試一次，找到的話游標歸零重新累積，
+            # 找不到才真的算「找不到」。
+            idx = full_text.find(prefix)
+            if idx == -1:
+                problems.append({
+                    "text": text, "declared_start": declared_start,
+                    "issue": "重新轉錄的成品裡完全找不到這句話的開頭幾個字——"
+                             "可能是剪輯點選錯位置、或這段內容根本沒被剪進最終影片，"
+                             "務必人工核對。",
+                })
+                continue
+        search_from = idx + len(prefix)
+        real_start = char_times[idx]
+        drift = declared_start - real_start
+        if abs(drift) > DRIFT_WARN_SEC:
+            direction = "偷跑（字幕比語音早出現）" if drift > 0 else "延遲（字幕比語音晚出現）"
+            problems.append({
+                "text": text, "declared_start": declared_start, "real_start": round(real_start, 2),
+                "issue": f"{direction} {abs(drift):.2f} 秒，超過 {DRIFT_WARN_SEC} 秒門檻。",
+            })
+
+    if not problems:
+        log(f"[通過] {len(subtitles)} 句字幕都跟重新轉錄的實際語音時間對得上（誤差在 {DRIFT_WARN_SEC} 秒內）。")
+        return 0
+
+    log(f"[警告] 發現 {len(problems)} 句字幕可能跟語音對不上，不要直接交付，先處理：")
+    for p in problems:
+        log(f"  - 「{p['text']}」（宣稱 start={p['declared_start']}）：{p['issue']}")
+    return 1
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="出片後驗證字幕跟語音是否同步")
+    parser.add_argument("edit_state", help="edit_state.json 的路徑")
+    args = parser.parse_args()
+    sys.exit(verify(Path(args.edit_state).expanduser().resolve()))
+
+
+if __name__ == "__main__":
+    main()
