@@ -24,7 +24,7 @@ import sys
 import time
 from pathlib import Path
 
-from av_tools import DEFAULT_FONT_BOLD, find_ffmpeg_cmd, find_magick_cmd, ffprobe_duration, find_ffprobe_cmd, log
+from av_tools import DEFAULT_FONT_BOLD, find_ffmpeg_cmd, find_magick_cmd, ffprobe_duration, find_ffprobe_cmd, log, resolve_cli_path
 
 
 # ---------------------------------------------------------------------------
@@ -91,14 +91,27 @@ def build_kept_video(ffmpeg_cmd: str, ffprobe_cmd: str, source_video: Path,
 
     work_dir.mkdir(parents=True, exist_ok=True)
     beat_paths = []
+    # 每段尾端統一多留這麼多秒的緩衝，跟 edit_state.json 裡 clips[].end
+    # 算得多準無關，一律都加。踩過的教訓：即使判斷層已經很小心地照
+    # .words.json 算緩衝，Whisper/Groq 給的字尾時間戳本身就有系統性偏早
+    # 的誤差（字音的自然衰減常常沒被算進那個字的時間戳裡），使用者實測
+    # 交付的成品還是聽到「最後一個字被切一半」——這不是判斷層算得不夠
+    # 仔細，是 ASR 時間戳這個資料來源本身的精度上限，光靠更小心地手算
+    # 緩衝解決不了，要在執行層統一補一層保險。
+    #
+    # 這裡不會讓字幕/B-roll 的時間跟著跑掉：下面的 real_durations 是量測
+    # 每段「真正剪出來多長」（已經含這段 pad），字幕時間換算用的是這個
+    # 真實值，不是 clips[].end - clips[].start 這個理論值，兩者本來就有
+    # 落差、也本來就有 _shift_to_real_timeline() 在處理，多出來的 pad
+    # 只是讓每段尾端多出一小截不影響字幕顯示的「靜音緩衝尾巴」而已。
+    END_PAD_SEC = 0.2
     for i, clip in enumerate(kept):
         beat_path = work_dir / f"beat_{i:03d}.mp4"
-        duration = clip["end"] - clip["start"]
-        # 剪重點片段常常會剛好切在一句話的尾音附近（Whisper/Groq 的句尾時間戳
-        # 本來就有數十~一兩百毫秒的誤差空間），沒有任何緩衝的硬切在使用者
-        # 實測時聽起來像是最後一個字被吃掉。這裡在每段尾端加一個很短的音量
-        # 淡出（不影響畫面/時間軸，只是讓收尾不要那麼硬），單段太短
-        # （<0.3s）就不加，避免淡出把整段都蓋過去。
+        ideal_duration = clip["end"] - clip["start"]
+        duration = ideal_duration + END_PAD_SEC
+        # 尾端音量淡出：時間點要落在「加了 pad 之後」的真正尾端，不是
+        # ideal_duration 那個點——否則淡出反而會提早發生在 pad 那段
+        # 補回來的音訊正中間，把剛救回來的字尾又蓋掉一次。
         fade_dur = 0.12
         af = f"afade=t=out:st={max(duration - fade_dur, 0):.3f}:d={fade_dur}" if duration > 0.3 else None
         # 曾經試過「粗略快轉＋精準微調」的兩段式尋帶（-ss 分別放在 -i 前後）
@@ -581,6 +594,26 @@ def render(edit_state_path: Path) -> Path:
     # （見那段註解）；其餘輸入/輸出都用絕對路徑，不受 cwd 影響。
     subprocess.run(cmd, check=True, cwd=str(assets_dir))
 
+    # 把「這支成品實際燒進去的字幕時間」（已經套用過 _shift_to_real_timeline，
+    # 不是 edit_state.json 裡原始的理想時間）另存一份 sidecar 檔，讓
+    # verify_render.py 拿來當比對基準用。這是修一個踩過的坑：
+    # edit_state.json 裡 subtitles[] 寫的是「假設每段剛好等於 end-start
+    # 長度」算出來的理想時間軸，跟真正剪出來、拼接後的時間軸幾乎一定有
+    # 落差（幀率量化、或像現在這樣刻意加的尾端安全緩衝都會造成落差）。
+    # 這支腳本自己在燒字幕前已經正確換算過（見上面 _shift_to_real_timeline
+    # 那段），但 verify_render.py 過去是直接拿 edit_state.json 的原始理想
+    # 時間去跟重新轉錄的真實語音比對——兩邊基準不一致，落差小的時候
+    # 剛好還在 0.4 秒門檻內看不出來，直到某次改動（例如把尾端安全緩衝
+    # 從幾乎 0 秒加大到 0.2 秒）讓累積落差變大，才讓一堆其實燒得正確的
+    # 字幕被誤判成「偷跑」。不要再讓 verify 用理想時間去比對真實成品，
+    # 這裡把真正燒進去的時間存下來，verify_render.py 優先讀這份。
+    timeline_path = out_path.with_suffix(".timeline.json")
+    timeline_path.write_text(
+        json.dumps({"subtitles": state.get("subtitles", []), "broll": state.get("broll", [])},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
     log(f"完成：{out_path}")
     return out_path
 
@@ -589,7 +622,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="讀 edit_state.json 輸出短影音成品")
     parser.add_argument("edit_state", help="edit_state.json 的路徑")
     args = parser.parse_args()
-    render(Path(args.edit_state).expanduser().resolve())
+    render(resolve_cli_path(args.edit_state))
 
 
 if __name__ == "__main__":
