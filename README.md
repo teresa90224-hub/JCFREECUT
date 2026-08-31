@@ -12,7 +12,14 @@
 ## 快速上手（Windows）
 
 **最簡單的方式：下載這個 repo（Code → Download ZIP，或 `git clone`）解壓縮後，
-直接雙擊執行 `setup.bat`**——會自動幫你：
+直接雙擊執行 `setup.bat`**：
+
+```bash
+git clone https://github.com/teresa90224-hub/JCFREECUT.git
+cd JCFREECUT
+```
+
+雙擊 `setup.bat` 會自動幫你：
 
 1. 檢查 Python、跑 `pip install -r requirements.txt` 裝好套件
 2. 檢查 ffmpeg／ImageMagick，沒有的話用 winget 自動安裝（電腦上沒有 winget
