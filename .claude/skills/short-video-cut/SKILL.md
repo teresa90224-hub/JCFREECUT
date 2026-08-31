@@ -63,7 +63,7 @@ description: 把一支錄好的長版原始影片（如會議錄影、教學錄�
 呼叫 `new_project.py`（不要自己重寫這段邏輯）：
 
 ```bash
-cd "<你 clone 這個 repo 的路徑>" && \
+cd "<你 clone 這個 repo 的路徑>/短影音編輯器" && \
 python new_project.py "<原始影片完整路徑>" --name "<專案名稱>"
 ```
 

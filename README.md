@@ -29,7 +29,7 @@
    short-video-cut/` 裡的技能檔會自動被載入，Claude 接下來會照著技能檔的
    流程幫你問清楚需求、轉字幕、判斷剪輯點、出片。
 3. 也可以不透過 Claude，直接手動跑：見下方「標準流程」的三行指令。
-4. 出片之後想手動微調字幕/標題，開 `python caption_editor/server.py`，
+4. 出片之後想手動微調字幕/標題，開 `python 短影音編輯器/caption_editor/server.py`，
    瀏覽器打開 http://localhost:8770。
 
 沒有要用 `setup.bat`、想自己手動裝的話，照下面「環境需求」跟
@@ -65,7 +65,11 @@ setx PEXELS_API_KEY "你的key"
 
 ## 標準流程
 
+實際的程式碼在 `短影音編輯器/` 這個子資料夾裡，下面的指令都要先 `cd` 進去：
+
 ```bash
+cd 短影音編輯器
+
 # 1. 建專案 + 轉字幕（含逐句 .srt 跟逐字時間戳 .words.json）
 python new_project.py "path/to/原始影片.mp4" --name "專案名稱"
 
@@ -102,6 +106,7 @@ schema，不是另一套格式），改完可以在網頁上直接按「產生�
 `render.py` 出片。
 
 ```bash
+cd 短影音編輯器
 python caption_editor/server.py
 # 開瀏覽器 http://localhost:8770
 ```
