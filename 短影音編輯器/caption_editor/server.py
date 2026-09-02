@@ -304,11 +304,11 @@ def _run_words_job(job_id: str, rel_path: str):
     with JOBS_LOCK:
         JOBS[job_id]["status"] = "running"
     code = (
-        "import sys; sys.path.insert(0, r'" + str(ROOT) + "'); "
+        "import sys; sys.path.insert(0, sys.argv[1]); "
         "from pathlib import Path; from new_project import run_whisper; "
-        "run_whisper(Path(r'" + str(source_video) + "'), Path(r'" + str(source_video.parent) + "'))"
+        "run_whisper(Path(sys.argv[2]), Path(sys.argv[3]))"
     )
-    cmd = [sys.executable, "-c", code]
+    cmd = [sys.executable, "-c", code, str(ROOT), str(source_video), str(source_video.parent)]
     proc = subprocess.Popen(
         cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace", bufsize=1,

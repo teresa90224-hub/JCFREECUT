@@ -117,10 +117,21 @@ def make_project_dirs(project_dir: Path) -> None:
 def copy_source_video(video_path: Path, project_dir: Path) -> Path:
     dest = project_dir / "01_source" / video_path.name
     if dest.exists():
-        log(f"01_source 已有同名檔案，略過複製：{dest.name}")
+        try:
+            same_file = video_path.resolve() == dest.resolve() or os.path.samefile(video_path, dest)
+        except OSError:
+            same_file = False
+        if same_file:
+            log(f"01_source 已有同名檔案，略過複製：{dest.name}")
+            return dest
+        src_stat, dest_stat = video_path.stat(), dest.stat()
+        if src_stat.st_size == dest_stat.st_size and int(src_stat.st_mtime) == int(dest_stat.st_mtime):
+            log(f"01_source 已有內容相同的同名檔案，略過複製：{dest.name}")
+            return dest
+        log(f"01_source 已有同名但內容不同的檔案，視為新版本並覆蓋：{dest.name}（原檔案已被取代）")
     else:
         log("複製原始影片到 01_source/ ...（檔案較大時請耐心等候）")
-        shutil.copy2(video_path, dest)
+    shutil.copy2(video_path, dest)
     return dest
 
 
@@ -212,6 +223,11 @@ def run_whisper_legacy(source_video: Path, transcript_dir: Path) -> dict:
         "--word_timestamps", "True",
         "--output_format", "json",
         "--output_dir", str(transcript_dir),
+        # openai-whisper CLI 預設 --verbose True 會邊轉邊把每一段逐句時間戳
+        # 跟文字即時印到 stdout。這裡沒有 capture_output，交給 agent 執行時
+        # 那些逐句輸出會被當成 shell 指令輸出整段讀進上下文，長影片可能就是
+        # 幾百行——關掉 verbose，失敗時仍然靠下面的 except 印出 exit code。
+        "--verbose", "False",
     ]
     try:
         subprocess.run(cmd, check=True)
@@ -555,21 +571,28 @@ def write_project_meta(project_dir: Path, project_name: str, source_video: Path,
     srt_path = transcript.get("srt")
     words_path = transcript.get("words")
     qa_report_path = transcript.get("qa_report")
+    meta_path = project_dir / "06_meta" / "project.json"
+    existing: dict = {}
+    if meta_path.exists():
+        try:
+            existing = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            existing = {}
     meta = {
         "project_name": project_name,
-        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "created_at": existing.get("created_at", datetime.datetime.now().isoformat(timespec="seconds")),
         "source_video": str(source_video),
         "transcript_srt": str(srt_path) if srt_path and srt_path.exists() else None,
         "transcript_words": str(words_path) if words_path and words_path.exists() else None,
         "transcript_qa_report": str(qa_report_path) if qa_report_path and qa_report_path.exists() else None,
-        # 下面這些欄位先留空，對應影片 demo 中 Claude 會接著詢問使用者
-        # 的兩件事：走哪種模板、這一集的主題。由 short-video-cut Skill
-        # 在對話中問完使用者後，自己把答案寫回這個檔案。
-        "template": None,        # 例如 "talking_head_3zone" 或 "selfie_cover_mask"
-        "topic": None,           # 用來重新命名資料夾的簡短主題句
-        "status": "transcribed", # transcribed -> cut -> captioned -> rendered
+        # 下面這些欄位對應影片 demo 中 Claude 會接著詢問使用者的兩件事：
+        # 走哪種模板、這一集的主題。由 short-video-cut Skill 在對話中
+        # 問完使用者後，自己把答案寫回這個檔案。若專案已存在（例如重跑
+        # 轉錄），沿用既有值，不因為重新轉錄而被清空。
+        "template": existing.get("template"),  # 例如 "talking_head_3zone" 或 "selfie_cover_mask"
+        "topic": existing.get("topic"),         # 用來重新命名資料夾的簡短主題句
+        "status": existing.get("status", "transcribed"), # transcribed -> cut -> captioned -> rendered
     }
-    meta_path = project_dir / "06_meta" / "project.json"
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"專案設定檔已寫入：{meta_path}")
     return meta_path

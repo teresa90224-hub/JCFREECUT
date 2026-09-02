@@ -220,9 +220,10 @@ def render_text_card(magick_cmd: str, text: str, font_cfg: dict, out_path: Path,
         subprocess.run([
             magick_cmd, "-size", f"{box_w}x{box_h}", "xc:none", "-fill", bg_color,
             "-draw", f"roundrectangle 0,0,{box_w},{box_h},24,24", str(out_path),
-        ], check=True)
+        ], check=True, capture_output=True)
     else:
-        subprocess.run([magick_cmd, "-size", f"{box_w}x{box_h}", "xc:none", str(out_path)], check=True)
+        subprocess.run([magick_cmd, "-size", f"{box_w}x{box_h}", "xc:none", str(out_path)],
+                        check=True, capture_output=True)
 
     # 用 Center gravity 算每一行相對「整個字卡正中央」要偏移多少，不要
     # 自己去猜字型的 ascent/baseline 在哪裡（之前那版用 North + 手算
@@ -251,7 +252,7 @@ def render_text_card(magick_cmd: str, text: str, font_cfg: dict, out_path: Path,
         else:
             cmd += ["-stroke", "none", "-fill", line_color, "-annotate", f"+0+{offset}", line]
         cmd.append(str(out_path))
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, capture_output=True)
 
 
 def render_title(magick_cmd: str, title_cfg: dict, canvas_w: int, out_path: Path) -> None:
@@ -414,7 +415,7 @@ def build_background(magick_cmd: str, canvas_w: int, canvas_h: int, bg_color: st
     if cta_png:
         cmd += [str(cta_png), "-gravity", "South", "-geometry", "+0+120", "-composite"]
     cmd.append(str(out_path))
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, capture_output=True)
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
@@ -585,7 +586,15 @@ def render(edit_state_path: Path) -> Path:
     # 對應語音的畫面。不要只靠 -shortest，直接用剪完拼接後量到的真實總長
     # 明確指定輸出時間，保證影片長度精準對齊音軌／字幕。
     total_kept_duration = real_clips[-1]["real_end"] if real_clips else 0.0
-    cmd = [ffmpeg_cmd, "-y", *input_args, "-filter_complex", filter_complex,
+    # -hide_banner -loglevel error：不加的話 ffmpeg 預設會把 codec/stream
+    # banner 跟編碼中的逐幀進度統計（frame=... fps=... time=...）整包印到
+    # stderr。這裡是輸出整支成品的合成指令，交給 agent（Codex/Claude Code）
+    # 執行時這些逐幀輸出會被當成 shell 指令的輸出整段讀進上下文，一次合成
+    # 可能就是幾百到上千行，很快把 context/usage 燒光。只壓 loglevel 到
+    # error，不加 capture_output，是因為真的失敗時還是要讓 stderr 直接
+    # 冒出來，不要連錯誤訊息都吞掉、變成看不出哪裡失敗。
+    cmd = [ffmpeg_cmd, "-hide_banner", "-loglevel", "error", "-y", *input_args,
+           "-filter_complex", filter_complex,
            "-map", "[outv]", "-map", audio_out, "-c:v", "libx264", "-pix_fmt", "yuv420p",
            "-crf", "20", "-preset", "medium", "-c:a", "aac", "-b:a", "128k",
            "-t", str(total_kept_duration), "-shortest",
