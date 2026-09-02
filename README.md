@@ -117,6 +117,7 @@ cd 短影音編輯器
 python caption_editor/server.py
 # 開瀏覽器 http://localhost:8770
 ```
+![Uploading edit_state 編輯器_1.png…]()
 
 ### 「draft → approved」：GUI 只給看得到成品的人挑
 
