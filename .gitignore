@@ -11,3 +11,5 @@ __pycache__/
 # 系統/編輯器雜項
 .DS_Store
 Thumbs.db
+
+短影音編輯器/.venv/
