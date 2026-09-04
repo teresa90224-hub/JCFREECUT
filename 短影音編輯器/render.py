@@ -463,9 +463,36 @@ def render(edit_state_path: Path) -> Path:
         b["end"] = _shift_to_real_timeline(b["end"], real_clips)
 
     layout = state.get("layout", {})
-    canvas_w, canvas_h = (1080, 1920) if layout.get("ratio", "9:16") == "9:16" else (1920, 1080)
-    video_h = round(canvas_w * 9 / 16)  # 主影片區塊固定 16:9，貼在畫布中間
-    video_y = (canvas_h - video_h) // 2
+    ratio = layout.get("ratio", "9:16")
+    if ratio == "9:16":
+        canvas_w, canvas_h = 1080, 1920
+        video_h = round(canvas_w * 9 / 16)  # 主影片區塊固定 16:9，貼在畫布中間
+        video_y = (canvas_h - video_h) // 2
+    else:
+        # 16:9（橫式）：跟 9:16 用同一顆「畫布寬 = 主影片全寬」的邏輯，但
+        # 9:16 版那個 canvas_w*9/16 算法直接套到橫式會讓 video_h 等於整個
+        # canvas_h，主影片會直接蓋滿全畫面、把 build_background 已經畫好的
+        # 標題卡／CTA 卡整個蓋掉（兩者疊圖順序是先畫背景+字卡，再疊主影片
+        # 上去，見下面 overlay 那段）。改成明確保留跟 build_background 位移量
+        # 對齊的上下留白：TITLE_ZONE 對應標題卡 90px 邊界 + 最高 260px 卡片，
+        # CTA_ZONE 對應 CTA 卡 120px 邊界 + 140px 卡片，中間剩下的高度才是
+        # 主影片區塊，維持跟 9:16 一樣「全寬、上下留白」的版面語言，不要改成
+        # 完全不同的置中縮小＋左右留黑的排版。
+        #
+        # 光留 TITLE_ZONE/CTA_ZONE 給卡片本身還不夠——字幕是疊在「主影片
+        # 下方」（sub_y_from_top = video_y + video_h + 60，下面第3節），
+        # 橫式畫布只有 1080px 高、沒有 9:16 那種上下大量留白，實測過
+        # （用真實素材剪一小段、輸出後截圖檢查）字幕直接畫在 CTA 卡的文字
+        # 正中間、疊在一起看不清楚。SUBTITLE_ZONE 額外多留一段給字幕本身
+        # （抓 emphasis 大字級、換行到兩行時的高度：68px 字級 * 1.25 行高
+        # * 2 行 ≈ 170px，加上跟主影片之間的 60px 間距，抓 230px 才夠，
+        # 不要只靠 60px 那個小間距就假設字幕一定塞得下）。
+        canvas_w, canvas_h = 1920, 1080
+        TITLE_ZONE = 90 + 260
+        CTA_ZONE = 120 + 140
+        SUBTITLE_ZONE = 230
+        video_h = canvas_h - TITLE_ZONE - CTA_ZONE - SUBTITLE_ZONE
+        video_y = TITLE_ZONE
     crop_filter = _crop_zoom_filter(layout.get("crop", {})) if layout.get("crop") else ""
 
     # 2. 標題卡／CTA 卡
@@ -507,7 +534,14 @@ def render(edit_state_path: Path) -> Path:
     #    分割會被切壞，這是之前手動測試才需要的 bash 中介，render.py
     #    全程在 Python 裡執行完全不需要。
     input_args: list[str] = ["-loop", "1", "-i", str(background_png), "-i", str(kept_video)]
-    video_scale = f"{crop_filter}scale={canvas_w}:{video_h}"
+    # force_original_aspect_ratio=increase + crop（跟下面 broll 疊圖用的是
+    # 同一招）：先等比例縮放到「兩邊都蓋過目標框」再裁掉多的，維持來源影片
+    # 原本的長寬比，不要直接無視比例硬縮成目標框（那樣人臉/畫面會被拉扁或
+    # 拉寬）。9:16 版因為 video_h 剛好算成跟目標框同一個 16:9 比例，直接
+    # scale 沒有明顯變形，一直沒發現這個問題；16:9 版的 video_h 因為要留
+    # 空間給字幕/CTA 卡，跟畫布寬度湊出來的框已經不是 16:9 了，沒有這段
+    # 裁切的話畫面會被整個拉寬變形（實測發生過，使用者截圖回報過）。
+    video_scale = f"{crop_filter}scale={canvas_w}:{video_h}:force_original_aspect_ratio=increase,crop={canvas_w}:{video_h}"
     lines = [f"[1:v]{video_scale}[vid];",
              f"[0:v][vid]overlay=x=0:y={video_y}[tmp0];"]
     prev = "tmp0"
