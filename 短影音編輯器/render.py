@@ -17,6 +17,7 @@ edit_state.json 的欄位說明見同資料夾的 edit_state.example.json。
 """
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -104,38 +105,81 @@ def build_kept_video(ffmpeg_cmd: str, ffprobe_cmd: str, source_video: Path,
     # 真實值，不是 clips[].end - clips[].start 這個理論值，兩者本來就有
     # 落差、也本來就有 _shift_to_real_timeline() 在處理，多出來的 pad
     # 只是讓每段尾端多出一小截不影響字幕顯示的「靜音緩衝尾巴」而已。
+    #
+    # 2026-09-04 修一個真實 bug：這個 pad 原本無條件往後挖 END_PAD_SEC
+    # 秒，不管緊接在這段後面的來源畫面是什麼。如果使用者連續剪掉這段
+    # 之後的兩三句話（keep=false），這 0.2 秒的 pad 會直接把「已經被
+    # 剪掉」的那段畫面挖一小截出來、黏在保留段尾巴——使用者實測回報
+    # 「連續剪掉的句子沒有真的消失，會閃過好幾格畫面」，用 silencedetect
+    # 之類量不出來（那是音訊工具），是肉眼看畫面才發現的。修法：pad
+    # 不能超過「這段結尾」到「時間軸上緊接著的下一段（不管留或剪）開頭」
+    # 的空隙，空隙不夠就少挖，完全沒空隙（緊接著就是別的片段）就不挖。
     END_PAD_SEC = 0.2
+    fade_dur = 0.12
+    all_clips_by_start = sorted(clips, key=lambda c: c["start"])
+    keep_filenames = set()
     for i, clip in enumerate(kept):
-        beat_path = work_dir / f"beat_{i:03d}.mp4"
+        next_start = None
+        for c in all_clips_by_start:
+            if c is clip:
+                continue
+            if c["start"] >= clip["end"] - 1e-6:
+                if next_start is None or c["start"] < next_start:
+                    next_start = c["start"]
+        gap = (next_start - clip["end"]) if next_start is not None else END_PAD_SEC
+        end_pad = min(END_PAD_SEC, max(gap, 0.0))
+
         ideal_duration = clip["end"] - clip["start"]
-        duration = ideal_duration + END_PAD_SEC
-        # 尾端音量淡出：時間點要落在「加了 pad 之後」的真正尾端，不是
-        # ideal_duration 那個點——否則淡出反而會提早發生在 pad 那段
-        # 補回來的音訊正中間，把剛救回來的字尾又蓋掉一次。
-        fade_dur = 0.12
-        af = f"afade=t=out:st={max(duration - fade_dur, 0):.3f}:d={fade_dur}" if duration > 0.3 else None
-        # 曾經試過「粗略快轉＋精準微調」的兩段式尋帶（-ss 分別放在 -i 前後）
-        # 想解決懷疑中的尋帶不精準問題，結果反而是誤診：實測用 silencedetect
-        # 量過，單純 `-ss <start> -i source`（-ss 在 -i 之前，輸入端尋帶）
-        # 剪出來的每一段音訊完全正常、內容也對得上逐字稿，兩段式尋帶那版
-        # 才是真正壞掉的——它會讓每段尾端固定少掉接近「快轉緩衝秒數」長度
-        # 的音訊（整段變成純靜音，不是淡出，是真的没聲音），因為 audio/video
-        # 兩個 stream 對「快轉後再精準往前跳」的位移量沒有對齊。**不要再
-        # 加這種二段式尋帶了**——這台工具鏈遇到的來源檔案，單純的輸入端
-        # `-ss` 就已經是準確的，不需要、也不能再疊加第二個 `-ss`。
-        cmd = [
-            ffmpeg_cmd, "-y", "-ss", str(clip["start"]), "-i", str(source_video),
-            "-t", str(duration),
-        ]
-        if af:
-            cmd += ["-af", af]
-        cmd += [
-            "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-c:a", "aac",
-            str(beat_path),
-        ]
-        subprocess.run(cmd, check=True, capture_output=True)
+        duration = ideal_duration + end_pad
+
+        # 快取指紋：start/end/實際 pad 三個值完全沒變，代表這段剪出來的
+        # 內容跟上次一模一樣，直接沿用舊檔、跳過剪片+重新編碼（這是整支
+        # render.py 最花時間的一步）。只要使用者動到剪輯點——包括只是
+        # 動到「隔壁」的片段導致這裡算出來的 end_pad 跟著變——指紋就會
+        # 換，自動觸發重剪，不用另外寫「哪裡改了」的比對邏輯。檔名用
+        # 指紋命名（不是像以前的 beat_000.mp4 那樣用位置編號），這樣同一
+        # 段內容就算在 clips[] 裡的順序被挪動過，也還是能命中快取。
+        fingerprint = f"{clip['start']:.3f}:{clip['end']:.3f}:{end_pad:.3f}"
+        cache_key = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:12]
+        beat_path = work_dir / f"beat_{cache_key}.mp4"
+        keep_filenames.add(beat_path.name)
+
+        if beat_path.exists():
+            log(f"beat {i}（{beat_path.name}）沿用快取，跳過重剪。")
+        else:
+            # 尾端音量淡出：時間點要落在「加了 pad 之後」的真正尾端，不是
+            # ideal_duration 那個點——否則淡出反而會提早發生在 pad 那段
+            # 補回來的音訊正中間，把剛救回來的字尾又蓋掉一次。
+            af = f"afade=t=out:st={max(duration - fade_dur, 0):.3f}:d={fade_dur}" if duration > 0.3 else None
+            # 曾經試過「粗略快轉＋精準微調」的兩段式尋帶（-ss 分別放在 -i 前後）
+            # 想解決懷疑中的尋帶不精準問題，結果反而是誤診：實測用 silencedetect
+            # 量過，單純 `-ss <start> -i source`（-ss 在 -i 之前，輸入端尋帶）
+            # 剪出來的每一段音訊完全正常、內容也對得上逐字稿，兩段式尋帶那版
+            # 才是真正壞掉的——它會讓每段尾端固定少掉接近「快轉緩衝秒數」長度
+            # 的音訊（整段變成純靜音，不是淡出，是真的没聲音），因為 audio/video
+            # 兩個 stream 對「快轉後再精準往前跳」的位移量沒有對齊。**不要再
+            # 加這種二段式尋帶了**——這台工具鏈遇到的來源檔案，單純的輸入端
+            # `-ss` 就已經是準確的，不需要、也不能再疊加第二個 `-ss`。
+            cmd = [
+                ffmpeg_cmd, "-y", "-ss", str(clip["start"]), "-i", str(source_video),
+                "-t", str(duration),
+            ]
+            if af:
+                cmd += ["-af", af]
+            cmd += [
+                "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-c:a", "aac",
+                str(beat_path),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+            _warn_if_beat_has_dead_air(ffmpeg_cmd, beat_path, i)
         beat_paths.append(beat_path)
-        _warn_if_beat_has_dead_air(ffmpeg_cmd, beat_path, i)
+
+    # 清掉不再有任何一段對應到的舊快取檔——剪輯點改過，指紋跟著換，
+    # 舊檔案就再也不會被任何一輪跑到，留著只會讓 render_work 資料夾
+    # 越長越大。
+    for old in work_dir.glob("beat_*.mp4"):
+        if old.name not in keep_filenames:
+            old.unlink(missing_ok=True)
 
     real_durations = [ffprobe_duration(ffprobe_cmd, p) for p in beat_paths]
     ideal_acc = 0.0
@@ -161,11 +205,38 @@ def build_kept_video(ffmpeg_cmd: str, ffprobe_cmd: str, source_video: Path,
             f.write(f"file '{p.name}'\n")
 
     concat_out = work_dir / "kept_concat.mp4"
-    cmd = [
-        ffmpeg_cmd, "-y", "-f", "concat", "-safe", "0",
-        "-i", str(list_path), "-c", "copy", str(concat_out),
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    # 2026-09-04 修過兩次真實 bug：
+    # 第一次：這裡原本音訊也是 `-c copy`（純串接、不重新編碼）。AAC 是
+    # 有狀態的壓縮格式，每個獨立編碼出來的 beat_*.mp4 開頭都帶一小段
+    # 「編碼器暖機延遲」（encoder priming samples），純串接時這些延遲在
+    # 接點對不齊，聽起來就是接點卡一下、喀一聲——直接分析過成品的音框
+    # 時間戳驗證過：接點附近的音框間隔會偏離正常的 21.33ms，證實不是
+    # 猜測。片段數越多（這支後來被使用者用逐字編輯器切成 26 段），踩到
+    # 這個問題的機率跟次數就越高，使用者因此聽到「斷斷續續」。
+    # 第二次：改成同一條 `-f concat` 指令裡混用 `-c:v copy -c:a aac`
+    # （影片複製、音訊重編碼）想同時保留影片複製的速度又修好音訊——
+    # 結果 concat demuxer 混用「一軌複製、一軌重編碼」會在讀完第一個
+    # 輸入檔後就默默停止（沒有任何錯誤訊息，exit code 還是 0），輸出
+    # 只剩第一段的長度，等於整支影片被腰斬——這是實際渲染後量到輸出
+    # 時長只剩 10 秒（剛好等於 beat_000 的長度）才抓到的，不是靠讀
+    # ffmpeg 文件猜的。改成分三步：先用純複製把「影片軌」串接起來
+    # （這條路徑可靠，維持速度），再用純重編碼把「音軌」串接起來
+    # （只有音訊，檔案小、重編碼很快），最後把這兩支合併成一支
+    # （音視軌都用複製合併，不會再有 demuxer 混用複製/重編碼的問題）。
+    video_only = work_dir / "kept_concat_video.mp4"
+    audio_only = work_dir / "kept_concat_audio.m4a"
+    subprocess.run([
+        ffmpeg_cmd, "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+        "-an", "-c:v", "copy", str(video_only),
+    ], check=True, capture_output=True)
+    subprocess.run([
+        ffmpeg_cmd, "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+        "-vn", "-c:a", "aac", "-b:a", "192k", str(audio_only),
+    ], check=True, capture_output=True)
+    subprocess.run([
+        ffmpeg_cmd, "-y", "-i", str(video_only), "-i", str(audio_only),
+        "-map", "0:v", "-map", "1:a", "-c", "copy", str(concat_out),
+    ], check=True, capture_output=True)
     return concat_out, real_clips
 
 
@@ -199,7 +270,8 @@ def _shift_to_real_timeline(t: float, real_clips: list[dict]) -> float:
 # ---------------------------------------------------------------------------
 
 def render_text_card(magick_cmd: str, text: str, font_cfg: dict, out_path: Path,
-                      box_w: int, box_h: int, bg_color: str | None = None) -> None:
+                      box_w: int, box_h: int, bg_color: str | None = None,
+                      align: str = "center") -> None:
     """
     字卡文字支援用 \\n 分成好幾行，每一行可以各自上色（例如標題兩句話，
     第一句白色、第二句紅色，像新聞標題那種樣式）——第一行用 `color`，
@@ -233,38 +305,67 @@ def render_text_card(magick_cmd: str, text: str, font_cfg: dict, out_path: Path,
     lines = text.split("\n")
     line_height = round(size * 1.25)
     n = len(lines)
+    # align="left" 用 West gravity（畫面左緣中線）取代 Center，讓每一行從
+    # 卡片左邊界對齊起排，不再各自水平置中——左上角小角標用這個樣式比較
+    # 像正常的標題排版；置中的滿版大標題（9:16 版、16:9 舊版的 CTA 卡）
+    # 不受影響，維持原本 align="center" 預設值。
+    gravity = "West" if align == "left" else "Center"
+    x_offset = 24 if align == "left" else 0
 
     for i, line in enumerate(lines):
         if not line.strip():
             continue
         line_color = color if i == 0 else color2
         offset = round((i - (n - 1) / 2) * line_height)
-        cmd = [magick_cmd, str(out_path), "-gravity", "Center", "-font", font, "-pointsize", str(size)]
+        cmd = [magick_cmd, str(out_path), "-gravity", gravity, "-font", font, "-pointsize", str(size)]
         if shadow_offset:
             # 陰影：半透明黑色、往右下偏移
             cmd += ["-fill", "#00000080", "-stroke", "none",
-                    "-annotate", f"+{shadow_offset}+{offset + shadow_offset}", line]
+                    "-annotate", f"+{x_offset + shadow_offset}+{offset + shadow_offset}", line]
         if stroke_color and stroke_width:
             # 描邊 + 實色字疊兩次，才會又有黑框又有實色字
             cmd += ["-stroke", stroke_color, "-strokewidth", str(stroke_width),
-                    "-fill", line_color, "-annotate", f"+0+{offset}", line]
-            cmd += ["-stroke", "none", "-fill", line_color, "-annotate", f"+0+{offset}", line]
+                    "-fill", line_color, "-annotate", f"+{x_offset}+{offset}", line]
+            cmd += ["-stroke", "none", "-fill", line_color, "-annotate", f"+{x_offset}+{offset}", line]
         else:
-            cmd += ["-stroke", "none", "-fill", line_color, "-annotate", f"+0+{offset}", line]
+            cmd += ["-stroke", "none", "-fill", line_color, "-annotate", f"+{x_offset}+{offset}", line]
         cmd.append(str(out_path))
         subprocess.run(cmd, check=True, capture_output=True)
 
 
-def render_title(magick_cmd: str, title_cfg: dict, canvas_w: int, out_path: Path) -> None:
-    box_w = min(canvas_w - 140, 940)
-    render_text_card(magick_cmd, title_cfg["text"], title_cfg, out_path, box_w, 260,
-                      bg_color=title_cfg.get("background"))
+def _text_card_content_height(cfg: dict, padding: int) -> int:
+    """依實際文字行數＋字級估算字卡「剛好夠用」的高度，不像固定寫死的
+    260/140 那樣不管內容多短都佔滿最大高度——16:9 版画布高度本來就
+    緊繃（見下面 layout.ratio 那段），字卡佔太多會直接排擠到主影片
+    區塊，必須知道實際內容需要多少空間才給多少。"""
+    text = cfg.get("text", "") or ""
+    size = cfg.get("size", 48)
+    line_height = round(size * 1.25)
+    n_lines = max(1, text.count("\n") + 1)
+    return n_lines * line_height + padding
 
 
-def render_cta(magick_cmd: str, cta_cfg: dict, canvas_w: int, out_path: Path) -> None:
-    box_w = min(canvas_w - 180, 900)
-    render_text_card(magick_cmd, cta_cfg["text"], cta_cfg, out_path, box_w, 140,
-                      bg_color=cta_cfg.get("background", "#FF6D5A"))
+def _title_box_w(canvas_w: int) -> int:
+    return min(canvas_w - 140, 940)
+
+
+def _cta_box_w(canvas_w: int) -> int:
+    return min(canvas_w - 180, 900)
+
+
+def render_title(magick_cmd: str, title_cfg: dict, canvas_w: int, out_path: Path,
+                  box_h: int = 260, bg_color_override: str | None = "__unset__",
+                  box_w: int | None = None, align: str = "center") -> None:
+    bg = title_cfg.get("background") if bg_color_override == "__unset__" else bg_color_override
+    render_text_card(magick_cmd, title_cfg["text"], title_cfg, out_path, box_w or _title_box_w(canvas_w), box_h,
+                      bg_color=bg, align=align)
+
+
+def render_cta(magick_cmd: str, cta_cfg: dict, canvas_w: int, out_path: Path,
+                box_h: int = 140, bg_color_override: str | None = "__unset__") -> None:
+    bg = cta_cfg.get("background", "#FF6D5A") if bg_color_override == "__unset__" else bg_color_override
+    render_text_card(magick_cmd, cta_cfg["text"], cta_cfg, out_path, _cta_box_w(canvas_w), box_h,
+                      bg_color=bg)
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +448,7 @@ def _auto_wrap_cjk(text: str, canvas_w: int, font_size: int, margin_lr: int = SU
 
 
 def build_ass_file(subtitles: list[dict], style: dict, canvas_w: int, canvas_h: int,
-                    sub_y_from_top: int, out_path: Path) -> None:
+                    margin_v: int, out_path: Path, alignment: int = 8) -> None:
     """整句金句卡樣式（不是逐字 karaoke）：subtitles 是一句一筆的清單
     [{"text","start","end","emphasis"}]——emphasis 由讀逐字稿時的內容判斷
     決定（這句話夠不夠精簡有力、值不值得特別強調），不是跟著時間軸算的。
@@ -372,7 +473,7 @@ def build_ass_file(subtitles: list[dict], style: dict, canvas_w: int, canvas_h: 
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
         f"Style: Default,{font_family},{size},{color},{outline_color},&H00000000,"
-        f"-1,0,0,0,100,100,0,0,1,{outline_val},{shadow_val},8,{SUB_MARGIN_LR},{SUB_MARGIN_LR},{sub_y_from_top},1\n\n"
+        f"-1,0,0,0,100,100,0,0,1,{outline_val},{shadow_val},{alignment},{SUB_MARGIN_LR},{SUB_MARGIN_LR},{margin_v},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -408,12 +509,13 @@ def _escape_ffmpeg_filter_value(value: str) -> str:
 # ---------------------------------------------------------------------------
 
 def build_background(magick_cmd: str, canvas_w: int, canvas_h: int, bg_color: str,
-                      title_png: Path | None, cta_png: Path | None, out_path: Path) -> None:
+                      title_png: Path | None, cta_png: Path | None, out_path: Path,
+                      title_margin: int = 90, cta_margin: int = 120) -> None:
     cmd = [magick_cmd, "-size", f"{canvas_w}x{canvas_h}", f"xc:{bg_color}"]
     if title_png:
-        cmd += [str(title_png), "-gravity", "North", "-geometry", "+0+90", "-composite"]
+        cmd += [str(title_png), "-gravity", "North", "-geometry", f"+0+{title_margin}", "-composite"]
     if cta_png:
-        cmd += [str(cta_png), "-gravity", "South", "-geometry", "+0+120", "-composite"]
+        cmd += [str(cta_png), "-gravity", "South", "-geometry", f"+0+{cta_margin}", "-composite"]
     cmd.append(str(out_path))
     subprocess.run(cmd, check=True, capture_output=True)
 
@@ -464,35 +566,59 @@ def render(edit_state_path: Path) -> Path:
 
     layout = state.get("layout", {})
     ratio = layout.get("ratio", "9:16")
+    title_margin, cta_margin = 90, 120
+    title_card_h, cta_card_h = 260, 140
     if ratio == "9:16":
         canvas_w, canvas_h = 1080, 1920
         video_h = round(canvas_w * 9 / 16)  # 主影片區塊固定 16:9，貼在畫布中間
         video_y = (canvas_h - video_h) // 2
     else:
-        # 16:9（橫式）：跟 9:16 用同一顆「畫布寬 = 主影片全寬」的邏輯，但
-        # 9:16 版那個 canvas_w*9/16 算法直接套到橫式會讓 video_h 等於整個
-        # canvas_h，主影片會直接蓋滿全畫面、把 build_background 已經畫好的
-        # 標題卡／CTA 卡整個蓋掉（兩者疊圖順序是先畫背景+字卡，再疊主影片
-        # 上去，見下面 overlay 那段）。改成明確保留跟 build_background 位移量
-        # 對齊的上下留白：TITLE_ZONE 對應標題卡 90px 邊界 + 最高 260px 卡片，
-        # CTA_ZONE 對應 CTA 卡 120px 邊界 + 140px 卡片，中間剩下的高度才是
-        # 主影片區塊，維持跟 9:16 一樣「全寬、上下留白」的版面語言，不要改成
-        # 完全不同的置中縮小＋左右留黑的排版。
+        # 16:9（橫式）：這支工具原本假設「橫式也維持跟 9:16 一樣的三區
+        # 堆疊版面（標題／主影片／CTA 各自獨立留白）」，2026-09-04 這天
+        # 連續修過兩次都還是治標不治本——只要標題／CTA 卡各自占用一塊
+        # 獨立的畫布高度，主影片的目標框高度就一定比來源矮，「放大後
+        # 裁切」這個做法就一定會裁掉來源畫面上下的內容（這支素材混雜
+        # 大量設備／雙螢幕特寫，裁到的常常就是螢幕上的關鍵資訊，使用者
+        # 截圖回報過兩次）。
         #
-        # 光留 TITLE_ZONE/CTA_ZONE 給卡片本身還不夠——字幕是疊在「主影片
-        # 下方」（sub_y_from_top = video_y + video_h + 60，下面第3節），
-        # 橫式畫布只有 1080px 高、沒有 9:16 那種上下大量留白，實測過
-        # （用真實素材剪一小段、輸出後截圖檢查）字幕直接畫在 CTA 卡的文字
-        # 正中間、疊在一起看不清楚。SUBTITLE_ZONE 額外多留一段給字幕本身
-        # （抓 emphasis 大字級、換行到兩行時的高度：68px 字級 * 1.25 行高
-        # * 2 行 ≈ 170px，加上跟主影片之間的 60px 間距，抓 230px 才夠，
-        # 不要只靠 60px 那個小間距就假設字幕一定塞得下）。
+        # 使用者確認後的最終方向：主影片改成真正滿版（video_h=canvas_h，
+        # video_y=0），標題／CTA／字幕全部改成疊在影片畫面「上面」的
+        # 疊圖層，不再各自占用獨立的畫布高度——這支來源剛好是 1280x720
+        # （16:9），跟畫布同比例，滿版後用 force_original_aspect_ratio=
+        # increase+crop 這段裁切邏輯實際上完全不會裁到任何東西（放大到
+        # 1920 寬剛好高度也是 1080，跟 video_h 一樣高，crop 是 no-op），
+        # 這是這支素材的巧合，不是通用保證——如果之後有專案的來源比例
+        # 跟畫布不同，這裡還是可能小幅裁切，但至少不會再被標題/CTA 卡
+        # 擠壓出一個遠比來源扁的目標框。
+        #
+        # title_card_h/cta_card_h 這裡依然是「卡片圖片本身要畫多高」
+        # （交給 render_title/render_cta 產生疊圖用的 PNG），跟 9:16 版
+        # 用途一樣，只是不再拿去反推 video_h——真正決定卡片疊在畫面上
+        # 哪個位置的是下面 filter_complex 組圖那段的 overlay x/y。
+        #
+        # 2026-09-04 再調一次：使用者看過滿版疊圖版後，希望標題改成
+        # 左上角的小標籤樣式（不要滿版置中的大標題），CTA 卡直接拿掉、
+        # 字幕改佔原本 CTA 卡的位置（畫面最下緣）。標題縮小成角標用的
+        # title_render_cfg 是複製一份 state["title"]、把字級縮小到
+        # 0.6 倍（62pt 大標題不適合塞進小角標，會爆版），不動
+        # state 本身——9:16 版仍然用原始未縮小的字級，這個縮小只在
+        # 16:9 疊圖模式生效。
+        # title_margin 這裡是角標跟畫布左上角的距離——使用者要求角標
+        # 「貼齊左上角」，改成很小的安全邊界（12px，避免圓角矩形的圓角
+        # 剛好卡在畫面最邊緣像素上），不要再沿用 9:16 版那組 40px 置中
+        # 留白的邏輯。cta_margin 現在没有 CTA 卡可用（使用者已要求拿掉），
+        # 保留變數只是不讓下面舊的 cta_card_h 算式炸掉，實際不會用到。
+        title_margin, cta_margin = 12, 40
+        title_render_cfg = None
+        if state.get("title"):
+            title_render_cfg = dict(state["title"])
+            title_render_cfg["size"] = max(20, round(state["title"].get("size", 48) * 0.6))
+        title_card_h = _text_card_content_height(title_render_cfg, padding=28) if title_render_cfg else 0
+        cta_card_h = _text_card_content_height(state["cta"], padding=32) if state.get("cta") else 0
         canvas_w, canvas_h = 1920, 1080
-        TITLE_ZONE = 90 + 260
-        CTA_ZONE = 120 + 140
-        SUBTITLE_ZONE = 230
-        video_h = canvas_h - TITLE_ZONE - CTA_ZONE - SUBTITLE_ZONE
-        video_y = TITLE_ZONE
+        video_h = canvas_h
+        video_y = 0
+    overlay_cards_on_video = ratio != "9:16"
     crop_filter = _crop_zoom_filter(layout.get("crop", {})) if layout.get("crop") else ""
 
     # 2. 標題卡／CTA 卡
@@ -501,24 +627,63 @@ def render(edit_state_path: Path) -> Path:
     title_png = None
     if state.get("title"):
         title_png = assets_dir / "title.png"
-        render_title(magick_cmd, state["title"], canvas_w, title_png)
+        # 疊在滿版影片上面時原本自動加了一塊半透明深色襯底維持可讀性，
+        # 2026-09-04 使用者看過後要求拿掉這塊「灰色網底」——文字本身已經
+        # 有黑色描邊＋陰影（render_text_card 一直都有這兩層），使用者判斷
+        # 這樣就夠清楚了，不需要再疊一層底色。改成永遠尊重 title.background
+        # 欄位本身（沒設就是 None＝透明，不再由這裡自動蓋一層預設色）。
+        # box_w：16:9 疊圖模式下角標用固定窄版（CORNER_TITLE_BOX_W），
+        # 不要沿用滿版置中標題那組寬度，否則角標會佔掉畫面左上一大塊。
+        title_bg_override = "__unset__"
+        title_box_w = None
+        if overlay_cards_on_video:
+            CORNER_TITLE_BOX_W = 620
+            title_box_w = min(CORNER_TITLE_BOX_W, canvas_w - 2 * title_margin)
+        render_cfg = title_render_cfg if overlay_cards_on_video else state["title"]
+        # align="left"：角標樣式要求文字從卡片左邊界對齊起排（見使用者
+        # 要求「字對齊左」），9:16 版維持預設的置中排版不受影響。
+        title_align = "left" if overlay_cards_on_video else "center"
+        render_title(magick_cmd, render_cfg, canvas_w, title_png, box_h=title_card_h,
+                     bg_color_override=title_bg_override, box_w=title_box_w, align=title_align)
     cta_png = None
     if state.get("cta"):
         cta_png = assets_dir / "cta.png"
-        render_cta(magick_cmd, state["cta"], canvas_w, cta_png)
+        render_cta(magick_cmd, state["cta"], canvas_w, cta_png, box_h=cta_card_h)
 
     bg_color = layout.get("background", {}).get("color", "#1b1d29")
     background_png = assets_dir / "background.png"
-    build_background(magick_cmd, canvas_w, canvas_h, bg_color, title_png, cta_png, background_png)
+    if overlay_cards_on_video:
+        # 卡片改成獨立疊圖層疊在滿版影片上面（見下面 filter_complex），
+        # 這裡的背景圖只是最底層的純色保險（正常情況下會被滿版影片完全
+        # 蓋住，看不到），不能再把卡片烤進這張背景圖裡，否則會被疊在它
+        # 上面的滿版影片整個蓋掉，等於卡片消失。
+        build_background(magick_cmd, canvas_w, canvas_h, bg_color, None, None, background_png)
+    else:
+        build_background(magick_cmd, canvas_w, canvas_h, bg_color, title_png, cta_png, background_png,
+                          title_margin=title_margin, cta_margin=cta_margin)
 
     # 3. 字幕（讀 subtitles[] 逐字時間戳 + subtitle_style，寫成一份 .ass 檔）
     ass_path = None
     if state.get("subtitles") and state.get("subtitle_style"):
         log("產生 .ass 字幕檔...")
-        sub_y_from_top = video_y + video_h + 60
+        if overlay_cards_on_video:
+            # 2026-09-04：原本沿用 9:16 版的「Alignment=8（頂部對齊）+
+            # 從畫面頂端算距離」，為了不讓 2 行 emphasis 大字滿出畫面底部，
+            # 得預留一塊約 175px 的保險空間，導致單行字幕（大多數情況）
+            # 看起來離底部還有一大截、使用者要求「再往下」時只能小幅微調
+            # （調保險值沒用，調太小 2 行字幕會出框）。改成
+            # Alignment=2（底部置中）——ASS/libass 語意下 MarginV 在這個
+            # alignment 底下是「離畫面底部的距離」，文字改成從底部往上長，
+            # 不管 1 行還是 2 行，底邊都固定貼在同一個距離，可以放心把這個
+            # 數字調到很小（貼近底部）也不會有多行文字被切掉的風險。
+            ass_alignment = 2
+            ass_margin_v = 26  # 離畫面底緣的距離，使用者要求「再往下」，直接貼近底部
+        else:
+            ass_alignment = 8
+            ass_margin_v = video_y + video_h + 60
         ass_path = assets_dir / "subtitles.ass"
         build_ass_file(state["subtitles"], state["subtitle_style"], canvas_w, canvas_h,
-                       sub_y_from_top, ass_path)
+                       ass_margin_v, ass_path, alignment=ass_alignment)
 
     # 4. B-roll：時間到了就疊在主影片畫面上面（同一個 16:9 區塊、同樣大小），
     #    蓋過主影片直到那段時間結束，跟 SKILL.md 講的「B-roll 蓋過主講畫面」
@@ -546,6 +711,28 @@ def render(edit_state_path: Path) -> Path:
              f"[0:v][vid]overlay=x=0:y={video_y}[tmp0];"]
     prev = "tmp0"
     idx = 2
+
+    if overlay_cards_on_video:
+        # 標題／CTA 卡片這裡才疊上去（滿版影片之後、broll/字幕之前）——
+        # 卡片本身是獨立的 -loop 1 圖片輸入，不是烤進 background.png，
+        # 所以要各自佔一個輸入編號，會往後推 broll/music 的 idx，這裡
+        # 用的是跟 broll 迴圈同一套「用 idx 累加、prev 串接」寫法，故意
+        # 保持一致寫法方便維護。
+        if title_png:
+            input_args += ["-loop", "1", "-i", str(title_png)]
+            # 角標樣式貼左上角，不要沿用滿版標題那組「置中」算法。
+            nxt = f"tmp{idx-1}"
+            lines.append(f"[{prev}][{idx}:v]overlay=x={title_margin}:y={title_margin}[{nxt}];")
+            prev = nxt
+            idx += 1
+        if cta_png:
+            input_args += ["-loop", "1", "-i", str(cta_png)]
+            cta_x = (canvas_w - _cta_box_w(canvas_w)) // 2
+            cta_y = canvas_h - cta_margin - cta_card_h
+            nxt = f"tmp{idx-1}"
+            lines.append(f"[{prev}][{idx}:v]overlay=x={cta_x}:y={cta_y}[{nxt}];")
+            prev = nxt
+            idx += 1
 
     for b in broll_entries:
         asset_path = project_dir / b["asset"]

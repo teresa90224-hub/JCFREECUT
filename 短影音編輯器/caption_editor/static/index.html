@@ -25,6 +25,17 @@
   .word-tok { position: relative; display: inline-block; padding: 3px 5px; margin: 1px; border-radius: 4px; outline: none; }
   .word-tok:hover { background: #eef0f4; }
   .word-tok.emph-word { color: #ff6d5a; font-weight: bold; }
+  /* 這個字時間格有效、但文字被清空了（校正文字跟原始逐字稿字數對不上時
+     的中間收尾格，見 initWordState 裡前綴/後綴比對那段）——不是 bug，是
+     刻意保留的時間格，只是沒有文字可顯示。之前完全沒樣式時，看起來就是
+     一塊莫名其妙的空白，使用者誤以為是打字打出來的空白格。用小尺寸＋
+     斜紋底色跟正常字明顯區隔，同時提示「這裡還是可以刪/斷句，只是沒字」。 */
+  .word-tok.is-empty {
+    min-width: 12px; padding: 3px 3px;
+    background: repeating-linear-gradient(45deg, #eef0f4, #eef0f4 3px, #f8f8fa 3px, #f8f8fa 6px);
+    border: 1px dashed #ccc;
+  }
+  .word-tok.is-empty:hover { background: repeating-linear-gradient(45deg, #e2e5ec, #e2e5ec 3px, #eef0f4 3px, #eef0f4 6px); }
   /* 拖曳斷句點經過某個字時，用一條藍色豎線標示「放開會斷在這裡」，
      不要整格變色——這樣才看得出來是卡在兩個字「中間」而不是選中那個字 */
   .word-tok.dropTarget::before {
@@ -440,8 +451,21 @@ function initWordState(words) {
         else break;
       }
       if (lo < hi) {
+        // 跟「整句重打」（見 startWholeCardEdit）用同一套做法，不要自己
+        // 另外發明一種「清空文字但保留格子」的狀態：兜不起來的文字整段
+        // 收進第一格，時間戳跟著延伸到最後一格的結尾（這段文字對應的
+        // 就是「這一整段時間」，不是分開的好幾小段），中間格子標成
+        // merged，不是清空文字——merged 的字不會再單獨畫出來（見
+        // isActive()），套用時也不會被當成使用者按 × 剪掉（不會被剪
+        // 進影片，見 server.py apply_word_edits 的註解）。之前的做法是
+        // 把中間格子的文字清空、格子本身留著照樣畫出來，那些空格子沒有
+        // 對應任何實際文字，只是視覺上一塊空白，看起來像 bug。
         wordState[cardWords[lo]].word = target.slice(pos, tailPos);
-        for (let k = lo + 1; k < hi; k++) wordState[cardWords[k]].word = '';
+        wordState[cardWords[lo]].end = wordState[cardWords[hi - 1]].end;
+        for (let k = lo + 1; k < hi; k++) {
+          wordState[cardWords[k]].merged = true;
+          boundarySet.delete(cardWords[k]);
+        }
       } else if (pos < tailPos) {
         // 理論上不會發生（前後綴只在完全比對時才前進），保險起見避免
         // 剩餘文字憑空消失。
@@ -466,7 +490,7 @@ function cardRanges() {
 function makeWordTok(i) {
   const w = wordState[i];
   const tok = document.createElement('span');
-  tok.className = 'word-tok';
+  tok.className = 'word-tok' + (w.word ? '' : ' is-empty');
   tok.contentEditable = 'true';
   tok.dataset.i = i;
   tok.appendChild(document.createTextNode(w.word));

@@ -279,6 +279,11 @@ def get_words(rel_path):
     if words_path is None:
         return jsonify({"exists": False})
     words = json.loads(words_path.read_text(encoding="utf-8"))
+    # Groq/Whisper 轉錄偶爾會吐出「有時間戳、但文字是空字串」的詞（通常是
+    # 氣音/雜音被判斷成一個詞卻辨識不出內容），逐字編輯器會照樣把它畫成
+    # 一個 word-tok 方塊，看起來就像一格空白——這格不是使用者編輯造成的，
+    # 過濾掉最單純，反正空字串本來就不該佔一個可編輯的字詞位置。
+    words = [w for w in words if w.get("word", "").strip()]
     words = _filter_words_to_kept_clips(words, state.get("clips", []))
     return jsonify({"exists": True, "words": words})
 
