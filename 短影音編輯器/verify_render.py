@@ -28,10 +28,12 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-from av_tools import log, resolve_cli_path
+from av_tools import find_ffmpeg_cmd, log, resolve_cli_path
 
 DRIFT_WARN_SEC = 0.4
 MATCH_PREFIX_LEN = 3
@@ -61,14 +63,23 @@ def _latest_render(project_dir: Path) -> Path | None:
 
 
 def _transcribe_words(groq_client, media_path: Path) -> list[dict]:
-    with media_path.open("rb") as f:
-        resp = groq_client.audio.transcriptions.create(
-            file=f,
-            model="whisper-large-v3",  # 不用 turbo：時間戳精準度較差，見 new_project.py 的說明
-            response_format="verbose_json",
-            language="zh",
-            timestamp_granularities=["word"],
-        )
+    # A rendered 9:16 video is often much larger than Groq's single-upload limit.
+    # Verification only needs speech, so always extract a compact Opus track first.
+    with tempfile.TemporaryDirectory(prefix="verify_render_") as temp_dir:
+        audio_path = Path(temp_dir) / "verify_audio.ogg"
+        subprocess.run([
+            find_ffmpeg_cmd(), "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(media_path), "-vn", "-c:a", "libopus", "-b:a", "64k",
+            "-ac", "1", "-ar", "16000", str(audio_path),
+        ], check=True)
+        with audio_path.open("rb") as f:
+            resp = groq_client.audio.transcriptions.create(
+                file=f,
+                model="whisper-large-v3",  # 不用 turbo：時間戳精準度較差，見 new_project.py 的說明
+                response_format="verbose_json",
+                language="zh",
+                timestamp_granularities=["word"],
+            )
     words = getattr(resp, "words", None) or []
     # groq SDK 回傳的 words 有時是物件（.word/.start/.end），有時是
     # dict（["word"]/["start"]/["end"]），視版本而定，兩種都要能吃。
@@ -169,6 +180,10 @@ def verify(edit_state_path: Path) -> int:
     if not words:
         log("[警告] 重新轉錄沒有拿到任何逐字時間戳，無法驗證，請人工聽過確認。")
         return 1
+    verify_words_path = render_path.with_suffix(".verify.words.json")
+    verify_words_path.write_text(json.dumps(words, ensure_ascii=False, indent=2),
+                                 encoding="utf-8", newline="\n")
+    log(f"成品逐字時間戳已寫入：{verify_words_path.name}")
 
     full_text, char_times = _flatten_words_to_text_index(words)
 
