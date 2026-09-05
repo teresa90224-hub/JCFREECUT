@@ -264,85 +264,204 @@ def _shift_to_real_timeline(t: float, real_clips: list[dict]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# 2. 文字圖卡（標題／CTA／字幕）：全部先用 ImageMagick 產生透明背景 PNG，
-#    再用 ffmpeg overlay 疊上去，理由跟 SKILL.md 講的一樣——字型/樣式
-#    完全可控，不受播放器字幕渲染差異影響。
+# 2. 文字圖卡（標題／CTA）：產生透明背景 PNG，再用 ffmpeg overlay 疊上去，
+#    理由跟 SKILL.md 講的一樣——字型/樣式完全可控，不受播放器字幕渲染
+#    差異影響。
+#
+#    2026-09-05：這一段原本靠外部 ImageMagick（`magick` 指令）畫，改成
+#    純 ffmpeg 的 drawtext/geq 實作，少一個外部相依（ffmpeg 本來就是這支
+#    工具鏈的硬相依，ImageMagick 只為了畫這幾張字卡而存在）。
 # ---------------------------------------------------------------------------
 
-def render_text_card(magick_cmd: str, text: str, font_cfg: dict, out_path: Path,
+CARD_CORNER_RADIUS = 24  # 有底色的字卡圓角半徑（沿用原本 ImageMagick roundrectangle 的 24）
+
+
+def _ff_color(hex_color: str, opacity: float | None = None) -> str:
+    """把 "#RRGGBB" 換成 ffmpeg 能吃的顏色字串。
+
+    ffmpeg 的顏色語法雖然也認 `#RRGGBB`，但 `#` 在 filter script 檔裡是
+    註解字元，統一改用 `0xRRGGBB` 這種到哪都安全的寫法。半透明用
+    `0xRRGGBB@0.5` 這種 `@不透明度` 後綴（0=全透明、1=不透明）。"""
+    h = hex_color.lstrip("#")
+    if len(h) == 8:  # 已經自帶 alpha 的 #RRGGBBAA，直接照原樣給 ffmpeg
+        return f"0x{h.upper()}"
+    base = f"0x{h.upper()}"
+    return base if opacity is None else f"{base}@{opacity}"
+
+
+def _ff_path_in_filter(path: str | Path) -> str:
+    """把檔案路徑包成能安全塞進 filtergraph 的字串。
+
+    Windows 路徑裡的磁碟機冒號是這裡唯一的地雷：filtergraph 用 `:` 分隔
+    option，`C:/...` 不處理的話會被切成兩半（實測錯誤訊息長這樣：
+    `No option name near '/Windows/Fonts/msjhbd.ttc:...'`）。實測有效的
+    寫法是「單引號包起來 + 冒號還是要跳脫成 \\:」，只做其中一半都不行
+    （單獨 `C\\:/...` 不加引號會失敗）。反斜線一律先換成正斜線，ffmpeg
+    在 Windows 上兩種都吃，正斜線不用再煩惱反斜線本身的跳脫。"""
+    p = str(path).replace("\\", "/")
+    return "'" + p.replace(":", "\\:") + "'"
+
+
+def _rounded_rect_alpha_filter(box_w: int, box_h: int, radius: int) -> str:
+    """圓角矩形底色：ffmpeg 沒有現成的 roundrectangle，用 geq 直接算每個
+    像素的 alpha——四個角各自跟最近的圓心比距離，超出半徑就設成全透明，
+    其餘全部不透明；RGB 三個通道原樣沿用輸入（也就是 color 來源的底色）。
+    geq 的表達式裡逗號是 filter option 的分隔字元，要跳脫成 \\, 才不會把
+    表達式切碎。"""
+    r = radius
+    dx = f"max(max({r}-X\\,X-(W-1-{r}))\\,0)"
+    dy = f"max(max({r}-Y\\,Y-(H-1-{r}))\\,0)"
+    alpha = f"if(lte(pow({dx}\\,2)+pow({dy}\\,2)\\,{r}*{r})\\,255\\,0)"
+    return f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{alpha}'"
+
+
+def render_text_card(ffmpeg_cmd: str, text: str, font_cfg: dict, out_path: Path,
                       box_w: int, box_h: int, bg_color: str | None = None,
                       align: str = "center") -> None:
     """
     字卡文字支援用 \\n 分成好幾行，每一行可以各自上色（例如標題兩句話，
     第一句白色、第二句紅色，像新聞標題那種樣式）——第一行用 `color`，
-    第二行（以後）用 `color2`（沒指定就跟第一行同色）。每一行都疊黑色
-    陰影（往右下偏移幾個像素、半透明黑）+ 黑色描邊 + 實色字三層，做出
-    截圖那種粗黑框帶陰影的效果。
+    第二行（以後）用 `color2`（沒指定就跟第一行同色）、字級用
+    `emphasis_size`（沒指定就跟第一行同字級）。每一行都有黑色陰影
+    （往右下偏移幾個像素、半透明黑）+ 黑色描邊 + 實色字三層，做出截圖
+    那種粗黑框帶陰影的效果——drawtext 自己就會依 shadowx/shadowy →
+    borderw → fontcolor 的順序把這三層畫好，不用像 ImageMagick 那版
+    疊三次 annotate。
+
+    太長的中文句子會先過 `_auto_wrap_cjk()` 自動斷行（中文沒有空白可以
+    斷字，任何渲染器的自動換行都靠不住，一定要自己先插換行），斷出來的
+    每一行沿用「它原本屬於哪一個來源行」的顏色/字級，不會因為斷行讓
+    第一句的下半截被當成第二句上到 color2。
+
+    文字內容一律走 drawtext 的 `textfile=`（把文字另外寫成 UTF-8 檔）
+    而不是 `text=`：`text=` 參數要同時應付 filtergraph 的跳脫、drawtext
+    自己的跳脫、還有 `%{}` 展開三層規則，中文/冒號/百分比/單引號隨便
+    一個都能把整條 filter 語法弄壞（這是實際踩過、卡很久的坑）。
+    textfile 只要檔案路徑本身乾淨就沒有任何內容跳脫問題，這裡再加上
+    `expansion=none` 連 `%{}`／反斜線展開都關掉，文字一律當字面值。
+    為了讓 textfile 路徑「乾淨」（不含磁碟機冒號、中文、空白），暫存檔
+    放在字卡輸出資料夾底下的暫存夾，ffmpeg 直接用 cwd 切過去、filter 裡
+    只寫相對檔名。
     """
-    font = font_cfg.get("font_path", DEFAULT_FONT_BOLD)
-    size = font_cfg.get("size", 48)
+    font = str(font_cfg.get("font_path", DEFAULT_FONT_BOLD)).replace("\\", "/")
+    size = int(font_cfg.get("size", 48))
+    emphasis_size = int(font_cfg.get("emphasis_size", size))
     color = font_cfg.get("color", "#FFFFFF")
     color2 = font_cfg.get("color2", color)
     border = font_cfg.get("border", {"color": "#000000", "width": 4})
     stroke_color = border.get("color", "#000000") if border else None
-    stroke_width = border.get("width", 4) if border else 0
-    shadow_offset = font_cfg.get("shadow_offset", 4)
+    stroke_width = int(border.get("width", 4)) if border else 0
+    shadow_offset = int(font_cfg.get("shadow_offset", 4))
 
-    if bg_color:
-        subprocess.run([
-            magick_cmd, "-size", f"{box_w}x{box_h}", "xc:none", "-fill", bg_color,
-            "-draw", f"roundrectangle 0,0,{box_w},{box_h},24,24", str(out_path),
-        ], check=True, capture_output=True)
-    else:
-        subprocess.run([magick_cmd, "-size", f"{box_w}x{box_h}", "xc:none", str(out_path)],
-                        check=True, capture_output=True)
-
-    # 用 Center gravity 算每一行相對「整個字卡正中央」要偏移多少，不要
-    # 自己去猜字型的 ascent/baseline 在哪裡（之前那版用 North + 手算
-    # 基準線位置，算出來的置中不準，字卡看起來會歪掉、沒有上下置中——
-    # Center gravity 是 ImageMagick 自己算文字置中，準確很多，多行的話
-    # 只要用「這一行離中間第幾行」乘上行高去對稱偏移就好）。
-    lines = text.split("\n")
-    line_height = round(size * 1.25)
-    n = len(lines)
-    # align="left" 用 West gravity（畫面左緣中線）取代 Center，讓每一行從
-    # 卡片左邊界對齊起排，不再各自水平置中——左上角小角標用這個樣式比較
-    # 像正常的標題排版；置中的滿版大標題（9:16 版、16:9 舊版的 CTA 卡）
-    # 不受影響，維持原本 align="center" 預設值。
-    gravity = "West" if align == "left" else "Center"
+    # align="left"：文字從卡片左邊界內縮 24px 起排（左上角小角標用這個
+    # 樣式比較像正常的標題排版）；置中的滿版大標題（9:16 版、16:9 舊版的
+    # CTA 卡）不受影響，維持原本 align="center" 預設值。
     x_offset = 24 if align == "left" else 0
 
-    for i, line in enumerate(lines):
-        if not line.strip():
+    # 來源行 → 視覺行（自動斷行後）。每個項目是 (文字, 顏色, 字級)。
+    visual_lines: list[tuple[str, str, int]] = []
+    for i, src_line in enumerate(text.split("\n")):
+        if not src_line.strip():
             continue
         line_color = color if i == 0 else color2
-        offset = round((i - (n - 1) / 2) * line_height)
-        cmd = [magick_cmd, str(out_path), "-gravity", gravity, "-font", font, "-pointsize", str(size)]
-        if shadow_offset:
-            # 陰影：半透明黑色、往右下偏移
-            cmd += ["-fill", "#00000080", "-stroke", "none",
-                    "-annotate", f"+{x_offset + shadow_offset}+{offset + shadow_offset}", line]
+        line_size = size if i == 0 else emphasis_size
+        wrapped = _auto_wrap_cjk(src_line, box_w, line_size, margin_lr=max(x_offset, 16))
+        for piece in wrapped.split("\n"):
+            if piece.strip():
+                visual_lines.append((piece, line_color, line_size))
+
+    tmp_dir = out_path.parent / "_textcard_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_files: list[Path] = []
+
+    # 每一行的高度各自照自己的字級算（第二行可能用 emphasis_size 放大），
+    # 再把整疊文字對整張卡片垂直置中：offset 是「這一行的中心」離「整疊
+    # 文字的中心」多遠，drawtext 的 y 用 (h-text_h)/2+offset 就會落在對的
+    # 位置。全部同字級時這個算式會退化成原本的 (i-(n-1)/2)*line_height。
+    heights = [round(sz * 1.25) for _, _, sz in visual_lines]
+    total_h = sum(heights)
+    filters: list[str] = []
+    if bg_color:
+        filters.append(_rounded_rect_alpha_filter(box_w, box_h, CARD_CORNER_RADIUS))
+
+    cum = 0
+    for idx, ((line, line_color, line_size), line_h) in enumerate(zip(visual_lines, heights)):
+        txt_file = tmp_dir / f"{out_path.stem}_l{idx}.txt"
+        # newline="" + 不補結尾換行：多一個換行 drawtext 會多畫一個空行，
+        # 整疊文字的垂直置中就會偏掉。
+        txt_file.write_text(line, encoding="utf-8", newline="")
+        tmp_files.append(txt_file)
+        offset = round(cum + line_h / 2 - total_h / 2)
+        cum += line_h
+        x_expr = str(x_offset) if align == "left" else "(w-text_w)/2"
+        opts = [
+            f"fontfile={_ff_path_in_filter(font)}",
+            f"textfile={txt_file.name}",
+            "expansion=none",
+            f"fontsize={line_size}",
+            f"fontcolor={_ff_color(line_color)}",
+            f"x={x_expr}",
+            f"y=(h-text_h)/2+({offset})",
+        ]
         if stroke_color and stroke_width:
-            # 描邊 + 實色字疊兩次，才會又有黑框又有實色字
-            cmd += ["-stroke", stroke_color, "-strokewidth", str(stroke_width),
-                    "-fill", line_color, "-annotate", f"+{x_offset}+{offset}", line]
-            cmd += ["-stroke", "none", "-fill", line_color, "-annotate", f"+{x_offset}+{offset}", line]
-        else:
-            cmd += ["-stroke", "none", "-fill", line_color, "-annotate", f"+{x_offset}+{offset}", line]
-        cmd.append(str(out_path))
-        subprocess.run(cmd, check=True, capture_output=True)
+            opts += [f"borderw={stroke_width}", f"bordercolor={_ff_color(stroke_color)}"]
+        if shadow_offset:
+            opts += [f"shadowcolor={_ff_color('#000000', 0.5)}",
+                     f"shadowx={shadow_offset}", f"shadowy={shadow_offset}"]
+        filters.append("drawtext=" + ":".join(opts))
+
+    src_color = _ff_color(bg_color) if bg_color else "black@0.0"
+    # format=rgba 一定要接在 lavfi 輸入串的 color 後面（同一條 input 描述
+    # 裡），不能只放在 -vf 的第一段：實測後者做出來的「透明」字卡整張
+    # alpha 都是 255（不透明黑底），因為 color 來源會先協商成沒有 alpha
+    # 的格式、之後才被轉成 rgba，透明度在那一步就被吃掉了。有底色的字卡
+    # 因為 geq 會自己重寫 alpha，看不出這個差別——只有透明字卡會壞。
+    cmd = [
+        ffmpeg_cmd, "-y",
+        "-f", "lavfi", "-i", f"color=c={src_color}:s={box_w}x{box_h}:d=1,format=rgba",
+        "-vf", ",".join(filters) if filters else "null",
+        "-frames:v", "1", "-pix_fmt", "rgba", str(out_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=120, cwd=str(tmp_dir))
+    finally:
+        for f in tmp_files:
+            f.unlink(missing_ok=True)
+        try:
+            tmp_dir.rmdir()
+        except OSError:
+            pass  # 同一次 render 還有其他字卡的暫存檔在用，留著很正常
 
 
-def _text_card_content_height(cfg: dict, padding: int) -> int:
+def _text_card_content_height(cfg: dict, padding: int, box_w: int | None = None,
+                               align: str = "center") -> int:
     """依實際文字行數＋字級估算字卡「剛好夠用」的高度，不像固定寫死的
     260/140 那樣不管內容多短都佔滿最大高度——16:9 版画布高度本來就
     緊繃（見下面 layout.ratio 那段），字卡佔太多會直接排擠到主影片
-    區塊，必須知道實際內容需要多少空間才給多少。"""
+    區塊，必須知道實際內容需要多少空間才給多少。
+
+    給了 box_w 就會把 render_text_card 的中文自動換行也算進去（同一支
+    `_auto_wrap_cjk`、同一組參數），不然一句沒有手動斷行的長中文會在
+    render_text_card 裡被斷成 2~3 行、但這裡只算成 1 行，卡片高度不夠，
+    多出來的行會被切掉。沒給 box_w 就維持舊行為（只數手動的 \\n）。"""
     text = cfg.get("text", "") or ""
-    size = cfg.get("size", 48)
-    line_height = round(size * 1.25)
-    n_lines = max(1, text.count("\n") + 1)
-    return n_lines * line_height + padding
+    size = int(cfg.get("size", 48))
+    emphasis_size = int(cfg.get("emphasis_size", size))
+    x_offset = 24 if align == "left" else 0
+    total = 0
+    for i, src_line in enumerate(text.split("\n")):
+        line_size = size if i == 0 else emphasis_size
+        n = 1
+        if box_w:
+            n = _auto_wrap_cjk(src_line, box_w, line_size,
+                               margin_lr=max(x_offset, 16)).count("\n") + 1
+        total += n * round(line_size * 1.25)
+    return max(total, round(size * 1.25)) + padding
+
+
+# 16:9 疊圖模式下左上角小角標的固定寬度——算卡片高度（要知道多寬才知道
+# 會斷成幾行）跟真正畫卡片時都要用到同一個數字，集中放這裡不要各寫一份。
+CORNER_TITLE_BOX_W = 620
 
 
 def _title_box_w(canvas_w: int) -> int:
@@ -353,18 +472,18 @@ def _cta_box_w(canvas_w: int) -> int:
     return min(canvas_w - 180, 900)
 
 
-def render_title(magick_cmd: str, title_cfg: dict, canvas_w: int, out_path: Path,
+def render_title(ffmpeg_cmd: str, title_cfg: dict, canvas_w: int, out_path: Path,
                   box_h: int = 260, bg_color_override: str | None = "__unset__",
                   box_w: int | None = None, align: str = "center") -> None:
     bg = title_cfg.get("background") if bg_color_override == "__unset__" else bg_color_override
-    render_text_card(magick_cmd, title_cfg["text"], title_cfg, out_path, box_w or _title_box_w(canvas_w), box_h,
+    render_text_card(ffmpeg_cmd, title_cfg["text"], title_cfg, out_path, box_w or _title_box_w(canvas_w), box_h,
                       bg_color=bg, align=align)
 
 
-def render_cta(magick_cmd: str, cta_cfg: dict, canvas_w: int, out_path: Path,
+def render_cta(ffmpeg_cmd: str, cta_cfg: dict, canvas_w: int, out_path: Path,
                 box_h: int = 140, bg_color_override: str | None = "__unset__") -> None:
     bg = cta_cfg.get("background", "#FF6D5A") if bg_color_override == "__unset__" else bg_color_override
-    render_text_card(magick_cmd, cta_cfg["text"], cta_cfg, out_path, _cta_box_w(canvas_w), box_h,
+    render_text_card(ffmpeg_cmd, cta_cfg["text"], cta_cfg, out_path, _cta_box_w(canvas_w), box_h,
                       bg_color=bg)
 
 
@@ -609,13 +728,28 @@ def render(edit_state_path: Path) -> Path:
         # 留白的邏輯。cta_margin 現在没有 CTA 卡可用（使用者已要求拿掉），
         # 保留變數只是不讓下面舊的 cta_card_h 算式炸掉，實際不會用到。
         title_margin, cta_margin = 12, 40
+        canvas_w, canvas_h = 1920, 1080
         title_render_cfg = None
         if state.get("title"):
             title_render_cfg = dict(state["title"])
             title_render_cfg["size"] = max(20, round(state["title"].get("size", 48) * 0.6))
-        title_card_h = _text_card_content_height(title_render_cfg, padding=28) if title_render_cfg else 0
-        cta_card_h = _text_card_content_height(state["cta"], padding=32) if state.get("cta") else 0
-        canvas_w, canvas_h = 1920, 1080
+        # box_w/align 這裡一定要跟下面真正呼叫 render_title/render_cta
+        # 時傳進去的值完全一致，_text_card_content_height 才會照同一組
+        # 換行結果算高度——傳漏了任何一個（尤其 box_w）就會讓這裡算成
+        # 「沒有自動換行」的單行高度，但 render_text_card 那邊實際上因為
+        # 內容太長觸發了 _auto_wrap_cjk 斷成兩三行，卡片畫出來的內容會
+        # 超出這裡算好的高度而被裁掉。16:9 疊圖模式下標題固定是左對齊的
+        # 窄版角標，所以這裡先把角標寬度算出來，跟下面 title_box_w 用
+        # 同一個算式。
+        title_corner_box_w = min(CORNER_TITLE_BOX_W, canvas_w - 2 * title_margin)
+        title_card_h = (
+            _text_card_content_height(title_render_cfg, padding=28, box_w=title_corner_box_w, align="left")
+            if title_render_cfg else 0
+        )
+        cta_card_h = (
+            _text_card_content_height(state["cta"], padding=32, box_w=_cta_box_w(canvas_w))
+            if state.get("cta") else 0
+        )
         video_h = canvas_h
         video_y = 0
     overlay_cards_on_video = ratio != "9:16"
@@ -637,18 +771,22 @@ def render(edit_state_path: Path) -> Path:
         title_bg_override = "__unset__"
         title_box_w = None
         if overlay_cards_on_video:
-            CORNER_TITLE_BOX_W = 620
-            title_box_w = min(CORNER_TITLE_BOX_W, canvas_w - 2 * title_margin)
+            # 用模組層級常數，不要在這裡再宣告一個同名區域變數——區域
+            # 賦值會讓 Python 把整個函式範圍內的 CORNER_TITLE_BOX_W 都
+            # 當成區域變數，上面 title_corner_box_w 那行（在這個賦值
+            # 之前執行）會變成讀取「還沒賦值的區域變數」直接噴
+            # UnboundLocalError（實測踩過）。
+            title_box_w = title_corner_box_w
         render_cfg = title_render_cfg if overlay_cards_on_video else state["title"]
         # align="left"：角標樣式要求文字從卡片左邊界對齊起排（見使用者
         # 要求「字對齊左」），9:16 版維持預設的置中排版不受影響。
         title_align = "left" if overlay_cards_on_video else "center"
-        render_title(magick_cmd, render_cfg, canvas_w, title_png, box_h=title_card_h,
+        render_title(ffmpeg_cmd, render_cfg, canvas_w, title_png, box_h=title_card_h,
                      bg_color_override=title_bg_override, box_w=title_box_w, align=title_align)
     cta_png = None
     if state.get("cta"):
         cta_png = assets_dir / "cta.png"
-        render_cta(magick_cmd, state["cta"], canvas_w, cta_png, box_h=cta_card_h)
+        render_cta(ffmpeg_cmd, state["cta"], canvas_w, cta_png, box_h=cta_card_h)
 
     bg_color = layout.get("background", {}).get("color", "#1b1d29")
     background_png = assets_dir / "background.png"
