@@ -19,6 +19,7 @@ edit_state.json 的欄位說明見同資料夾的 edit_state.example.json。
 import argparse
 import hashlib
 import json
+import math
 import re
 import subprocess
 import sys
@@ -36,6 +37,12 @@ from av_tools import DEFAULT_FONT_BOLD, find_ffmpeg_cmd, find_magick_cmd, ffprob
 
 _SILENCE_RE = re.compile(r"silence_duration: ([\d.]+)")
 _DEAD_AIR_THRESHOLD_SEC = 1.5
+
+# 2026-09-05：單次「-ss 尋帶 + 連續解碼」的秒數上限，超過就切成好幾段各自
+# 尋帶（見下面 _cut_beat 的說明）。25 秒這個數字不是隨便定的，是使用者
+# 在真實素材上手動試出來、已經驗證有效的 workaround 數字，這裡原封不動
+# 沿用，不要自己另外調一個「感覺比較合理」的數字。
+_MAX_CONTINUOUS_DECODE_SEC = 25.0
 
 
 def _warn_if_beat_has_dead_air(ffmpeg_cmd: str, beat_path: Path, beat_index: int) -> None:
@@ -70,6 +77,144 @@ def _warn_if_beat_has_dead_air(ffmpeg_cmd: str, beat_path: Path, beat_index: int
             f"應該是連續講話，這通常代表剪輯/尋帶出了問題（例如音訊被吃掉），"
             f"不要直接把成品交給使用者，先用 ffprobe/silencedetect 或重新聽過"
             f"確認再出片。")
+
+
+def _cut_beat(ffmpeg_cmd: str, source_video: Path, start: float, duration: float,
+              fade_dur: float, beat_path: Path) -> None:
+    """
+    剪出一段 beat_*.mp4（`start` 到 `start+duration`，來源時間軸）。
+
+    2026-09-05 修一個實測到、但沒辦法百分之百釘死根本機制的 bug：拿這支
+    工具鏈剪一支疑似某會議錄影軟體匯出的低規格素材（h264 16fps、
+    r_frame_rate 跟 avg_frame_rate 對不太起來的疑似 VFR；aac 16000Hz
+    mono ~62kbps）時，發現如果 `-ss` 尋帶起點離 clip 真正要的內容很遠、
+    中間要連續解碼很長一段時間才到得了，剪出來的 beat 音軌會在解碼路徑
+    中間某個位置憑空冒出好幾秒的靜音——直接對來源影片同一段時間範圍做
+    `silencedetect` 完全偵測不到任何靜音，另外把那段時間單獨送 Groq
+    （whisper-large-v3）重新轉錄，逐字稿也完整連貫，兩者都證實來源音檔
+    本身沒問題，是這一步剪接把音訊搞丟了。反覆測試發現關鍵變數是「尋帶
+    起點到目標內容之間要連續解碼幾秒」：只需要解碼十幾秒的近距離尋帶
+    從沒出過問題，需要連續解碼一兩分鐘以上的遠距離尋帶才會出現這個現象。
+    試過幾種合成測試檔（乾淨 CFR、刻意拉超長 GOP、人工拼接兩段影片製造
+    時間戳銜接點）都沒能重現，研判需要這支素材本身某種容器/編碼層級的
+    瑕疵（例如它記錄的 avg_frame_rate 沒有精準對上宣告的 r_frame_rate）
+    才會跟 ffmpeg 這個版本對這類來源做長距離 input seeking 時的內部解碼
+    路徑產生交互作用——沒辦法在這裡百分之百解釋成因，但已經確認「把
+    單次尋帶＋連續解碼的秒數壓在一個上限之內」在真實素材上可靠地避開了
+    這個問題（原本是使用者手動把 edit_state.json 的 clips[] 切成 ≤25 秒
+    小段的 workaround，這裡把它直接做成 render.py 的預設行為，呼叫端
+    不用再自己手動切段）。
+
+    做法：duration 沒超過 _MAX_CONTINUOUS_DECODE_SEC 就跟以前完全一樣，
+    單次 `-ss <start> -i source -t <duration>`（輸入端尋帶）直接剪。
+    曾經試過「粗略快轉＋精準微調」的兩段式尋帶（-ss 分別放在 -i 前後）
+    想解決懷疑中的尋帶不精準問題，結果反而是誤診：實測用 silencedetect
+    量過，單純 `-ss <start> -i source`（-ss 在 -i 之前，輸入端尋帶）
+    剪出來的每一段音訊完全正常、內容也對得上逐字稿，兩段式尋帶那版
+    才是真正壞掉的——它會讓每段尾端固定少掉接近「快轉緩衝秒數」長度
+    的音訊（整段變成純靜音，不是淡出，是真的没聲音），因為 audio/video
+    兩個 stream 對「快轉後再精準往前跳」的位移量沒有對齊。**不要再
+    加這種二段式尋帶了**——下面超過上限要切段的分支，每一段依然是
+    獨立的單階段尋帶（各自一組 `-ss ... -i ... -t ...`），互相之間沒有
+    再疊加第二層尋帶，跟這個教訓完全不衝突。
+
+    超過上限的處理：把 duration 切成好幾段、每段 ≤ 上限秒數，「先各自
+    剪成獨立的暫存檔案」（每段都還是單階段 `-ss`/`-t` 尋帶，跟原本的
+    單段剪法完全同一套邏輯，只是尋帶起點變近了），再對這些獨立檔案
+    用 concat filter 在「已解碼」的畫面/音框層級接起來、重新編碼一次
+    成最終的 beat 檔。
+
+    這裡有一個過程中順手抓到、額外驗證過的真實 ffmpeg 坑，記下來避免
+    以後重踩：一開始想省事，直接在同一個 ffmpeg 指令的 filter_complex
+    裡對「同一個來源檔案」開好幾次不同的 `-ss`（每個子片段各自一組
+    `-ss ... -i <同一個 source_video> ... -t ...`，全部指到同一個檔案
+    路徑），再用 concat filter 接起來——實測發現這台機器上的 ffmpeg
+    9.0.1 對這種寫法不可靠：用 `-show_frames`/逐路徑輸出量過，其中一路
+    的內容會在 concat 之後幾乎完全消失（只解碼到個位數的畫格），輸出
+    長度直接少掉那一段，不是效能問題，是內容真的憑空不見了——研判是
+    ffmpeg 內部依「原始 DTS」排序讀取多個輸入封包的排程機制，遇到
+    「同一個檔案被開兩次、兩次都尋帶到不同時間點」時對哪個輸入該讀多少
+    packet 判斷錯亂。這是另一個獨立於本函式要修的那個 bug、但一樣真實
+    存在的 ffmpeg 問題，順手在這裡避開：不要在同一個 filter_complex 裡
+    對同一個來源檔案疊加多個 `-ss`，要嘛先各自剪成獨立檔案（這裡採用
+    的做法），要嘛乾脆分開下多個 ffmpeg 指令。
+
+    暫存檔案獨立編碼再串接，一樣要避開這支工具鏈已經踩過的另一個坑
+    （見下面 build_kept_video 尾端拼接多段 beat 檔的註解）：獨立編碼出
+    來的 AAC 檔案如果直接純串接（concat demuxer + `-c copy`），接點因為
+    「編碼器暖機延遲」對不齊會有喀一聲的雜音；這裡改用 concat filter在
+    解碼層級接、最後統一重新編碼一次，就不會有這個問題。尾端的音量
+    淡出只套在最後一個子片段（用它自己的相對時間算淡出起點），子片段
+    之間的銜接處是完全連續的解碼內容，沒有額外的淡入/淡出或間隙。
+    """
+    if duration <= _MAX_CONTINUOUS_DECODE_SEC:
+        _cut_single_pass(ffmpeg_cmd, source_video, start, duration, fade_dur, beat_path)
+        return
+
+    n_chunks = math.ceil(duration / _MAX_CONTINUOUS_DECODE_SEC)
+    chunk_dur = duration / n_chunks  # 平均切，不要讓某一段特別短或特別長
+    chunk_dir = beat_path.parent / "_chunk_tmp"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    chunk_paths: list[Path] = []
+    sub_durs: list[float] = []
+    for i in range(n_chunks):
+        sub_start = start + i * chunk_dur
+        # 最後一段用「剩餘全部」而不是再乘一次 chunk_dur，避免浮點數
+        # 累加誤差讓最後一段的終點跟 duration 真正的終點對不齊。
+        sub_dur = (duration - i * chunk_dur) if i == n_chunks - 1 else chunk_dur
+        chunk_path = chunk_dir / f"{beat_path.stem}_c{i:02d}.mp4"
+        # 子片段一律不套淡出——套了的話每個子片段接縫處都會先淡出一次，
+        # 接起來會一直有音量忽大忽小的抽動感。淡出留到下面 concat 那一步
+        # 只套在「真正的最後一個子片段」上。
+        _cut_single_pass(ffmpeg_cmd, source_video, sub_start, sub_dur, fade_dur=0.0,
+                          beat_path=chunk_path, apply_fade=False)
+        chunk_paths.append(chunk_path)
+        sub_durs.append(sub_dur)
+
+    input_args: list[str] = []
+    filters: list[str] = []
+    for i, chunk_path in enumerate(chunk_paths):
+        input_args += ["-i", str(chunk_path)]
+        filters.append(f"[{i}:v]setpts=PTS-STARTPTS[v{i}]")
+        if i == n_chunks - 1 and duration > 0.3:
+            fade_st = max(sub_durs[i] - fade_dur, 0)
+            filters.append(
+                f"[{i}:a]asetpts=PTS-STARTPTS,afade=t=out:st={fade_st:.3f}:d={fade_dur}[a{i}]"
+            )
+        else:
+            filters.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
+    concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(n_chunks))
+    filters.append(f"{concat_inputs}concat=n={n_chunks}:v=1:a=1[outv][outa]")
+
+    cmd = [
+        ffmpeg_cmd, "-y", *input_args, "-filter_complex", ";".join(filters),
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-c:a", "aac", str(beat_path),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+    for chunk_path in chunk_paths:
+        chunk_path.unlink(missing_ok=True)
+    try:
+        chunk_dir.rmdir()
+    except OSError:
+        pass  # 還有其他 beat 的子片段暫存檔在用這個資料夾，留著很正常
+
+
+def _cut_single_pass(ffmpeg_cmd: str, source_video: Path, start: float, duration: float,
+                      fade_dur: float, beat_path: Path, apply_fade: bool = True) -> None:
+    """單階段輸入端尋帶剪一刀：`-ss <start> -i source -t <duration>`。
+    `_cut_beat` 不管要不要切段，最終落地的每一次實際剪片動作都靠這支
+    函式執行，維持只有一個地方在下這行指令。"""
+    af = None
+    if apply_fade and duration > 0.3:
+        af = f"afade=t=out:st={max(duration - fade_dur, 0):.3f}:d={fade_dur}"
+    cmd = [ffmpeg_cmd, "-y", "-ss", str(start), "-i", str(source_video), "-t", str(duration)]
+    if af:
+        cmd += ["-af", af]
+    cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "fast", "-c:a", "aac", str(beat_path)]
+    subprocess.run(cmd, check=True, capture_output=True)
+
 
 def build_kept_video(ffmpeg_cmd: str, ffprobe_cmd: str, source_video: Path,
                       clips: list[dict], work_dir: Path) -> tuple[Path, list[dict]]:
@@ -149,28 +294,15 @@ def build_kept_video(ffmpeg_cmd: str, ffprobe_cmd: str, source_video: Path,
         else:
             # 尾端音量淡出：時間點要落在「加了 pad 之後」的真正尾端，不是
             # ideal_duration 那個點——否則淡出反而會提早發生在 pad 那段
-            # 補回來的音訊正中間，把剛救回來的字尾又蓋掉一次。
-            af = f"afade=t=out:st={max(duration - fade_dur, 0):.3f}:d={fade_dur}" if duration > 0.3 else None
-            # 曾經試過「粗略快轉＋精準微調」的兩段式尋帶（-ss 分別放在 -i 前後）
-            # 想解決懷疑中的尋帶不精準問題，結果反而是誤診：實測用 silencedetect
-            # 量過，單純 `-ss <start> -i source`（-ss 在 -i 之前，輸入端尋帶）
-            # 剪出來的每一段音訊完全正常、內容也對得上逐字稿，兩段式尋帶那版
-            # 才是真正壞掉的——它會讓每段尾端固定少掉接近「快轉緩衝秒數」長度
-            # 的音訊（整段變成純靜音，不是淡出，是真的没聲音），因為 audio/video
-            # 兩個 stream 對「快轉後再精準往前跳」的位移量沒有對齊。**不要再
-            # 加這種二段式尋帶了**——這台工具鏈遇到的來源檔案，單純的輸入端
-            # `-ss` 就已經是準確的，不需要、也不能再疊加第二個 `-ss`。
-            cmd = [
-                ffmpeg_cmd, "-y", "-ss", str(clip["start"]), "-i", str(source_video),
-                "-t", str(duration),
-            ]
-            if af:
-                cmd += ["-af", af]
-            cmd += [
-                "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-c:a", "aac",
-                str(beat_path),
-            ]
-            subprocess.run(cmd, check=True, capture_output=True)
+            # 補回來的音訊正中間，把剛救回來的字尾又蓋掉一次。實際剪的
+            # 動作交給 _cut_beat：duration 不長就直接單次尋帶剪（跟以前
+            # 完全一樣的邏輯），duration 太長就自動切成多段各自尋帶再
+            # 接起來，避免遠距離尋帶＋長時間連續解碼憑空吃掉音訊那個
+            # bug（見 _cut_beat 開頭的完整說明）。
+            if duration > _MAX_CONTINUOUS_DECODE_SEC:
+                log(f"beat {i}（{beat_path.name}）長度 {duration:.1f} 秒超過"
+                    f"單次尋帶上限 {_MAX_CONTINUOUS_DECODE_SEC:.0f} 秒，自動切成多段尋帶剪接...")
+            _cut_beat(ffmpeg_cmd, source_video, clip["start"], duration, fade_dur, beat_path)
             _warn_if_beat_has_dead_air(ffmpeg_cmd, beat_path, i)
         beat_paths.append(beat_path)
 
