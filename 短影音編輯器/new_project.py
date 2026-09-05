@@ -34,10 +34,12 @@ import datetime
 import json
 import math
 import os
+import random
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from av_tools import find_ffmpeg_cmd, find_ffprobe_cmd, find_whisper_cmd, ffprobe_duration, log, srt_timestamp, resolve_cli_path
@@ -57,8 +59,16 @@ TOOLS_DIR = Path(__file__).resolve().parent
 PROJECTS_ROOT = TOOLS_DIR / "projects"
 
 # Whisper 設定：模型大小可依電腦效能調整（tiny/base/small/medium/large）
-# 先用 base，速度快很多；之後想要更準確的字幕，可以改成 small 或 medium。
-WHISPER_MODEL = "base"
+# 這個路徑只在完全沒有 GROQ_API_KEY／沒裝 groq 套件時才會當備援用到
+# （見 run_whisper 的優先序），所以準確度比速度重要：從 base 升級到
+# small——沒有 GPU、CPU int8 情境下 base 對中文常有明顯誤字，small 的
+# 參數量約是 base 的 3 倍，實測 CPU 時間對應拉長，但仍在可接受範圍；
+# 沒有直接跳 medium 是因為 medium 的參數量又是 small 的數倍，在純
+# CPU int8、沒有 GPU 加速的機器上跑起來可能明顯變慢（一支長影片可能
+# 從幾分鐘拉長到十幾二十分鐘以上），這條路徑本來就是備援、不常被觸發，
+# 先用溫和一階的升級換取準確度，如果之後發現 small 仍不夠準，再視情況
+# 評估要不要進一步升級到 medium。
+WHISPER_MODEL = "small"
 WHISPER_LANGUAGE = "zh"  # 中文影片；英文內容可改 "en" 或拿掉這個參數用自動偵測
 
 # Groq 雲端轉字幕設定：有設定 GROQ_API_KEY 環境變數時優先使用（最快）。
@@ -66,14 +76,29 @@ WHISPER_LANGUAGE = "zh"  # 中文影片；英文內容可改 "en" 或拿掉這�
 # 精準度跟少見口語現象（重複贅詞、快速接話）的辨識都比完整版差，
 # 實測踩過詞條時間戳異常長、相鄰詞條重疊、重複語句漏抓其中一次
 # 這幾個問題，換回完整版可以緩解（2026-08 debug AVIS專案時發現並換的）。
-# 免費層請求上限比 turbo 低（Groq Playground 顯示 20/分鐘、2000/天），
-# 但這個工作流程一支影片通常只呼叫個位數次，遠用不到這個上限。
+# 免費層請求上限比 turbo 低（Groq Playground 顯示 20/分鐘、2000/天）。
+# 2026-09 改成「FLAC 太大就切多段無損上傳」之後，這個上限不再穩穩用不到：
+# FLAC 檔案比之前的有損 Opus 大得多，同樣長度的影片會切出更多段；另外
+# QA 覆核（_repair_transcript_anomalies）遇到吞字多的素材，光是覆核就
+# 可能對這支 API 打出幾十到上百次請求（實測一支40分鐘會議錄影抓到83個
+# 異常詞，每個最多重試 QA_RECHECK_MAX_ATTEMPTS 次，理論上限就有166次）。
+# 所以不能再假設「用不到限制」，兩個呼叫點都包了 _call_groq_with_retry
+# 做 429 重試（見該函式說明），而不是靠「反正次數少」矇混過去。
 GROQ_MODEL = "whisper-large-v3"
 # 免費版帳號檔案上限 25MB，這裡抓 22MB 當安全門檻，留一點餘裕。
 GROQ_MAX_CHUNK_BYTES = 22 * 1024 * 1024
-# 壓縮音軌用的 bitrate（kbps）。只有 FLAC 超過大小上限時才會用到這個
-# 降級路徑（見 _extract_audio_for_transcription 的說明），所以不用壓到
-# 太低，優先保留辨識度。
+# 遇到 429（RateLimitError）時最多重試幾次、以及沒有 Retry-After 標頭時
+# 的指數退避基準秒數。免費層是 20 次/分鐘，退避到位通常只需要等幾秒到
+# 一分鐘內，5 次重試、每次翻倍，最壞情況大約再等 1+2+4+8+16=31 秒左右，
+# 足夠涵蓋一般的免費層冷卻時間；真的還是失敗就讓錯誤往外拋，不要無限重試
+# 把使用者晾在那裡看不出到底卡在哪。
+GROQ_RATE_LIMIT_MAX_RETRIES = 5
+GROQ_RATE_LIMIT_BACKOFF_BASE_SEC = 1.0
+# 壓縮音軌用的 bitrate（kbps）。FLAC 超過大小上限時，正常路徑是切成多段
+# 無損 FLAC 分開上傳（見 _extract_audio_for_transcription／_split_audio_
+# into_chunks 的說明），不會整包降級成這個有損格式；這個常數只留給「切
+# 段後某一段仍超過上限」這種理論上不該發生的邊界情況當最後手段，所以不
+# 用壓到太低，優先保留辨識度。
 GROQ_AUDIO_BITRATE_KBPS = 64
 
 # --- 轉錄後自動覆核（QA）設定 ---
@@ -106,6 +131,50 @@ def _to_traditional(text: str) -> str:
     opencc 套件時原樣放行，不擋住整個轉錄流程。
     """
     return _OPENCC.convert(text) if _OPENCC else text
+
+
+def _call_groq_with_retry(fn):
+    """
+    包住單次 Groq API 呼叫（`fn` 是一個不吃參數的 callable，內部自己
+    包好 `client.audio.transcriptions.create(...)`），遇到 429
+    （`groq.RateLimitError`）時自動退避重試，而不是讓整個轉錄流程直接
+    中斷。
+
+    這支工具鏈有兩個地方會在短時間內連續打很多次 Groq API：一是長影片
+    切成多段 FLAC 分開上傳（`run_whisper_groq`），二是 QA 覆核異常長詞
+    逐一單獨重轉（`_repair_transcript_anomalies`，實測過一支影片可能
+    對這支 API 打上百次請求）。免費層是 20 次/分鐘，只要影片夠長、
+    或吞字的異常詞夠多，就有機會撞到這個限制——2026-09 之前完全沒有
+    處理，一撞到就整個流程中斷、使用者不容易看出原因是「打太快」還是
+    真的壞掉，所以補上這層重試。
+
+    退避策略：優先讀 API 回應的 `Retry-After` 標頭（Groq 有回傳的話，
+    照它說的秒數等，最準），沒有的話用指數退避（`BACKOFF_BASE * 2**次數`
+    再加一點隨機抖動，避免多個請求同時醒來又一起撞牆）。重試
+    `GROQ_RATE_LIMIT_MAX_RETRIES` 次都還是 429 就讓例外往外拋，不無限
+    重試卡住使用者。
+    """
+    from groq import RateLimitError
+
+    last_err = None
+    for attempt in range(GROQ_RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            return fn()
+        except RateLimitError as e:
+            last_err = e
+            if attempt >= GROQ_RATE_LIMIT_MAX_RETRIES:
+                break
+            retry_after = None
+            try:
+                retry_after = float(e.response.headers.get("retry-after", ""))
+            except (AttributeError, TypeError, ValueError):
+                pass
+            if retry_after is None:
+                retry_after = GROQ_RATE_LIMIT_BACKOFF_BASE_SEC * (2 ** attempt) + random.uniform(0, 0.5)
+            log(f"Groq API 回傳 429（頻率限制），{retry_after:.1f} 秒後重試"
+                f"（第 {attempt + 1}/{GROQ_RATE_LIMIT_MAX_RETRIES} 次）...")
+            time.sleep(retry_after)
+    raise last_err
 
 
 def make_project_dirs(project_dir: Path) -> None:
@@ -269,10 +338,15 @@ def _extract_flac_audio(ffmpeg_cmd: str, source_video: Path, out_path: Path) -> 
     subprocess.run(cmd, check=True, capture_output=True)
 
 
-def _extract_compressed_audio(ffmpeg_cmd: str, source_video: Path, out_path: Path) -> None:
-    """把影片音軌抽出來，壓成低 bitrate 單聲道 opus，縮小上傳體積用（只在 FLAC 超過大小上限時才會用到，見下方 _extract_audio_for_transcription）。"""
+def _extract_compressed_audio(ffmpeg_cmd: str, input_path: Path, out_path: Path) -> None:
+    """
+    把音軌（可以是原始影片，也可以是已經抽好的音檔/切段）壓成低 bitrate
+    單聲道 opus，縮小體積用。只在 FLAC 切段後仍有某一段超過 Groq 單檔
+    上限這種邊界情況才會用到，見 _split_audio_into_chunks() 的說明——
+    正常情況下整個轉錄流程都走無損 FLAC，不會呼叫到這裡。
+    """
     cmd = [
-        ffmpeg_cmd, "-y", "-i", str(source_video),
+        ffmpeg_cmd, "-y", "-i", str(input_path),
         "-vn", "-ac", "1", "-ar", "16000",
         "-c:a", "libopus", "-b:a", f"{GROQ_AUDIO_BITRATE_KBPS}k",
         str(out_path),
@@ -282,7 +356,7 @@ def _extract_compressed_audio(ffmpeg_cmd: str, source_video: Path, out_path: Pat
 
 def _extract_audio_for_transcription(ffmpeg_cmd: str, source_video: Path, tmp_dir: Path) -> Path:
     """
-    優先用無損 FLAC 抽音軌上傳給 Groq。
+    抽出無損 FLAC 音軌上傳給 Groq。
 
     這是踩過真實的坑才這樣做的：實測發現 libopus（有損）編碼器**不是逐位元組
     決定性的**——同一支來源影片、同一組 ffmpeg 參數，編兩次出來的 24kbps
@@ -293,27 +367,32 @@ def _extract_audio_for_transcription(ffmpeg_cmd: str, source_video: Path, tmp_di
     兩次的話吞成一次。改用 FLAC 後，同一支影片不管轉幾次，位元組都逐一
     相同（已用 md5 驗證過），從根本消除了這個變因。
 
-    FLAC 檔案比較大，只有在超過 Groq 免費版單檔上限時才會降級用 Opus 壓縮
-    （這種情況下沒辦法保證同樣的穩定性，會印警告告訴使用者）。
+    FLAC 檔案超過 Groq 免費版單檔上限時，這裡**不會**整包降級成 Opus
+    ——而是原封不動回傳完整的無損 FLAC，交給呼叫端的 _split_audio_
+    into_chunks() 切成多段、每段各自在上限以下的無損 FLAC 分開上傳
+    （見 run_whisper_groq）。這樣即使影片很長，也不用犧牲「同一份音檔
+    重轉結果穩定」這個特性去換檔案大小。Opus 有損壓縮只保留在
+    _split_audio_into_chunks() 裡當「切完某一段仍超過上限」這種理論上
+    不該發生、但保險起見處理的最後手段。
     """
     flac_path = tmp_dir / "audio.flac"
     _extract_flac_audio(ffmpeg_cmd, source_video, flac_path)
-    if flac_path.stat().st_size <= GROQ_MAX_CHUNK_BYTES:
-        return flac_path
-
-    log(f"無損 FLAC 音軌約 {flac_path.stat().st_size / 1024 / 1024:.1f}MB，超過 Groq 免費版單檔上限，"
-        f"降級改用 {GROQ_AUDIO_BITRATE_KBPS}kbps Opus 壓縮（這種情況下無法保證每次轉錄結果完全穩定，"
-        "轉錄後請務必看一下自動產生的 QA 報告）。")
-    flac_path.unlink(missing_ok=True)
-    opus_path = tmp_dir / "audio.ogg"
-    _extract_compressed_audio(ffmpeg_cmd, source_video, opus_path)
-    return opus_path
+    return flac_path
 
 
 def _split_audio_into_chunks(ffmpeg_cmd: str, audio_path: Path, chunk_dir: Path) -> list[tuple[Path, float]]:
     """
     音檔太大時依時間切段，回傳 [(chunk路徑, 這段在原始音檔裡的起始秒數), ...]。
-    切段大小依 bitrate 反推，讓每段都在 GROQ_MAX_CHUNK_BYTES 以下。
+    切段大小依 bitrate 反推，讓每段都在 GROQ_MAX_CHUNK_BYTES 以下——輸入
+    通常是 _extract_audio_for_transcription() 回傳的無損 FLAC，切段時用
+    `-c copy` 純封裝、不重新編碼，所以切出來的每一段仍然是無損、位元組
+    可重現的 FLAC，不會像整包降級成 Opus 那樣引入不穩定性。
+
+    FLAC 的壓縮率會隨音檔內容變動（安靜段落壓得更小、講話密集的段落壓
+    得較大），只用「整檔平均 bytes/sec」反推的切法，個別段落理論上仍有
+    機率略微超過上限，所以先抓 10% 安全邊際；切完之後仍再逐段檢查一次
+    大小，萬一真的還有段落超標（理論上不該發生），才對那一段單獨降級
+    用 Opus 重新編碼當最後手段，其餘段落不受影響。
     """
     size_bytes = audio_path.stat().st_size
     if size_bytes <= GROQ_MAX_CHUNK_BYTES:
@@ -321,12 +400,12 @@ def _split_audio_into_chunks(ffmpeg_cmd: str, audio_path: Path, chunk_dir: Path)
 
     total_duration = ffprobe_duration(find_ffprobe_cmd(), audio_path)
     bytes_per_sec = size_bytes / total_duration
-    chunk_seconds = max(60.0, math.floor(GROQ_MAX_CHUNK_BYTES / bytes_per_sec))
+    chunk_seconds = max(60.0, math.floor(GROQ_MAX_CHUNK_BYTES * 0.9 / bytes_per_sec))
 
     log(f"音檔約 {size_bytes / 1024 / 1024:.1f}MB，超過 Groq 免費版單檔上限，"
-        f"依每段約 {chunk_seconds:.0f} 秒切段上傳...")
+        f"依每段約 {chunk_seconds:.0f} 秒切成多段無損 FLAC 分開上傳...")
 
-    suffix = audio_path.suffix  # .flac 或 .ogg，切段後容器格式要跟來源一致
+    suffix = audio_path.suffix  # 通常是 .flac；理論上也可能收到 .ogg 輸入
     chunk_pattern = chunk_dir / f"chunk_%03d{suffix}"
     cmd = [
         ffmpeg_cmd, "-y", "-i", str(audio_path),
@@ -336,7 +415,25 @@ def _split_audio_into_chunks(ffmpeg_cmd: str, audio_path: Path, chunk_dir: Path)
     subprocess.run(cmd, check=True, capture_output=True)
 
     chunks = sorted(chunk_dir.glob(f"chunk_*{suffix}"))
-    return [(c, i * chunk_seconds) for i, c in enumerate(chunks)]
+    result = [(c, i * chunk_seconds) for i, c in enumerate(chunks)]
+
+    oversized = [(c, offset) for c, offset in result if c.stat().st_size > GROQ_MAX_CHUNK_BYTES]
+    if oversized:
+        log(f"警告：{len(oversized)} 段切完後實際大小仍超過 Groq 單檔上限（FLAC 壓縮率隨內容變動導致），"
+            f"這幾段改降級用 {GROQ_AUDIO_BITRATE_KBPS}kbps Opus 壓縮上傳，無法保證這幾段的轉錄結果"
+            "完全穩定，轉錄後請務必看一下自動產生的 QA 報告。其餘段落維持無損 FLAC 不受影響。")
+        fixed = []
+        for c, offset in result:
+            if c.stat().st_size > GROQ_MAX_CHUNK_BYTES:
+                opus_chunk = c.with_suffix(".ogg")
+                _extract_compressed_audio(ffmpeg_cmd, c, opus_chunk)
+                c.unlink(missing_ok=True)
+                fixed.append((opus_chunk, offset))
+            else:
+                fixed.append((c, offset))
+        result = fixed
+
+    return result
 
 
 def _find_long_word_anomalies(words: list[dict], threshold: float = QA_LONG_WORD_THRESHOLD_SEC) -> list[dict]:
@@ -406,14 +503,20 @@ def _repair_transcript_anomalies(
             best_segments = None
             clean = False
             for attempt in range(QA_RECHECK_MAX_ATTEMPTS):
-                with clip_path.open("rb") as f:
-                    result = client.audio.transcriptions.create(
-                        file=f,
-                        model=GROQ_MODEL,
-                        response_format="verbose_json",
-                        language=WHISPER_LANGUAGE,
-                        timestamp_granularities=["word", "segment"],
-                    )
+                # 檔案要在 _call_groq_with_retry 的 callable 裡面重新開，
+                # 不能在外面開一次共用：429 重試會呼叫同一個 fn 好幾次，
+                # 如果檔案控制代碼是從外面傳進來的，第一次上傳失敗後游標
+                # 已經在檔尾，重試會傳出一個空檔案上去。
+                def _do_recheck_call(_clip_path=clip_path):
+                    with _clip_path.open("rb") as f:
+                        return client.audio.transcriptions.create(
+                            file=f,
+                            model=GROQ_MODEL,
+                            response_format="verbose_json",
+                            language=WHISPER_LANGUAGE,
+                            timestamp_granularities=["word", "segment"],
+                        )
+                result = _call_groq_with_retry(_do_recheck_call)
                 recheck_words = [
                     {"word": w["word"].strip(), "start": w["start"] + clip_win_start, "end": w["end"] + clip_win_start}
                     for w in (result.words or [])
@@ -478,12 +581,14 @@ def run_whisper_groq(source_video: Path, transcript_dir: Path) -> dict:
     用 Groq 雲端 API（whisper-large-v3）轉字幕，request 時一併要
     word 級 timestamp_granularities，同時拿到逐句與逐字時間戳。
     需要環境變數 GROQ_API_KEY（SDK 會自動讀取，這支程式不會碰到 key 本身）。
-    免費版帳號單檔 25MB 上限，音軌優先抽成無損 FLAC 上傳（見
+    免費版帳號單檔 25MB 上限，音軌抽成無損 FLAC 上傳（見
     _extract_audio_for_transcription 的說明：這是為了避免有損編碼器每次
-    編出來的位元組不一樣，導致同一支影片重轉結果不穩定），檔案太大時才
-    降級用壓縮格式，並視大小自動切段上傳再合併時間軸。轉錄完會自動跑一次
-    異常詞覆核（見 _repair_transcript_anomalies），把可能被吞掉的重複內容
-    抓出來修正或至少列進 QA 報告。
+    編出來的位元組不一樣，導致同一支影片重轉結果不穩定），檔案太大時
+    不整包降級成有損格式，而是切成多段各自在上限以下的無損 FLAC 分開
+    上傳（見 _split_audio_into_chunks），每段各自的 offset 疊加回原始
+    時間軸；只有極端邊界情況（切完某段仍超標）才會對那一段單獨降級成
+    Opus。轉錄完會自動跑一次異常詞覆核（見 _repair_transcript_anomalies），
+    把可能被吞掉的重複內容抓出來修正或至少列進 QA 報告。
     """
     from groq import Groq
 
@@ -502,14 +607,17 @@ def run_whisper_groq(source_video: Path, transcript_dir: Path) -> dict:
         all_words = []
         for i, (chunk_path, offset) in enumerate(chunks, start=1):
             log(f"上傳第 {i}/{len(chunks)} 段...")
-            with chunk_path.open("rb") as f:
-                result = client.audio.transcriptions.create(
-                    file=f,
-                    model=GROQ_MODEL,
-                    response_format="verbose_json",
-                    language=WHISPER_LANGUAGE,
-                    timestamp_granularities=["word", "segment"],
-                )
+
+            def _do_chunk_call(_chunk_path=chunk_path):
+                with _chunk_path.open("rb") as f:
+                    return client.audio.transcriptions.create(
+                        file=f,
+                        model=GROQ_MODEL,
+                        response_format="verbose_json",
+                        language=WHISPER_LANGUAGE,
+                        timestamp_granularities=["word", "segment"],
+                    )
+            result = _call_groq_with_retry(_do_chunk_call)
             for seg in result.segments:
                 all_segments.append({
                     "start": seg["start"] + offset,
