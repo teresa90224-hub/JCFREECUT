@@ -281,6 +281,9 @@ function restoreSnapshot(snap) {
     document.getElementById('wordsReady').style.display = 'none';
     document.getElementById('wordsMissing').style.display = 'block';
   }
+  // undo/redo 回到的是「某個編輯步驟當下」的狀態，跟檔案內容不見得一致，
+  // 一律當成未存檔（要跟檔案比對才能精確判斷，那樣太重也沒必要）
+  markUnsaved();
   refreshApproxPreview();
 }
 
@@ -401,6 +404,10 @@ document.getElementById('ratio').addEventListener('change', () => {
 });
 
 function collectLayoutAndCards() {
+  // 排版/字卡欄位的唯一收斂點——只要走到這裡就代表 currentState 被改過了。
+  // 存檔/產生影片也會先呼叫這支，但它們在寫檔成功後會再呼叫 markSaved()
+  // 把旗標清掉，順序上不會互相打架。
+  markUnsaved();
   if (!currentState.layout) currentState.layout = {};
   currentState.layout.ratio = document.getElementById('ratio').value;
   if (!currentState.layout.background) currentState.layout.background = {};
@@ -797,9 +804,46 @@ document.getElementById('approxSeek').addEventListener('change', () => {
   updateTransportUI();
 });
 
+// ---------- 「有沒有還沒存檔的改動」 ----------
+// GUI 裡所有編輯（排版/字卡欄位、逐字編輯、undo/redo）都只改瀏覽器記憶體
+// 裡的 currentState，要按「存檔」才會寫回 edit_state.json。之前完全沒有
+// 任何提示，關掉分頁或按重新整理就整份改動消失、連問都不會問一句。這裡
+// 用一個 dirty 旗標把狀態顯示在存檔鈕上，並在離開頁面/切換專案前攔一下。
+// 注意「產生影片」本身就會先存檔再出片，所以它也要一起把旗標清掉。
+let unsavedChanges = false;
+
+function markUnsaved() {
+  unsavedChanges = true;
+  updateSaveButton();
+}
+
+function markSaved() {
+  unsavedChanges = false;
+  updateSaveButton();
+}
+
+function updateSaveButton() {
+  const btn = document.getElementById('saveBtn');
+  if (!btn) return;
+  btn.textContent = unsavedChanges ? '存檔 ●' : '存檔';
+  btn.title = unsavedChanges ? '有尚未存檔的改動' : '目前的改動都已存檔';
+  // 沒有未存改動時降成次要色，有未存改動時用醒目的橘色把注意力拉回來
+  btn.style.background = unsavedChanges ? '' : '#44475a';
+}
+
+window.addEventListener('beforeunload', (e) => {
+  if (!unsavedChanges) return;
+  e.preventDefault();
+  e.returnValue = '';
+});
+
 document.getElementById('projectSelect').addEventListener('change', async (e) => {
   const relPath = e.target.value;
   if (!relPath) return;
+  if (unsavedChanges && !confirm('目前的專案有尚未存檔的改動，切換專案會直接遺失。確定要切換嗎？')) {
+    e.target.value = currentRelPath || '';
+    return;
+  }
   const res = await fetch('/api/state/' + relPath);
   const data = await res.json();
   currentState = data.state;
@@ -815,6 +859,7 @@ document.getElementById('projectSelect').addEventListener('change', async (e) =>
   refreshApproxPreview();
   document.getElementById('saveBtn').disabled = false;
   document.getElementById('renderBtn').disabled = false;
+  markSaved(); // 剛從檔案讀進來，記憶體跟檔案內容一致
   document.getElementById('renderLog').style.display = 'none';
   wordState = null;
   document.getElementById('wordsReady').style.display = 'none';
@@ -832,15 +877,19 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
     body: JSON.stringify(currentState),
   });
   status.textContent = res.ok ? '已存檔' : '存檔失敗';
+  if (res.ok) markSaved();
   setTimeout(() => status.textContent = '', 2000);
 });
 
 document.getElementById('renderBtn').addEventListener('click', async () => {
   collectLayoutAndCards();
+  // 出片前一定會先把目前狀態寫回檔案（render.py 讀的是檔案不是瀏覽器狀態），
+  // 所以這一步等於也做了存檔，旗標要一起清掉
   await fetch('/api/state/' + currentRelPath, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(currentState),
   });
+  markSaved();
   const log = document.getElementById('renderLog');
   log.style.display = 'block';
   log.textContent = '啟動 render.py...';
@@ -1206,6 +1255,7 @@ async function syncPreviewFromWordEdits() {
   currentState.clips = result.clips;
   currentState.subtitles = result.subtitles;
   currentState.broll = result.broll;
+  markUnsaved(); // 逐字編輯改的是記憶體，還沒寫回 edit_state.json
   refreshApproxPreview();
   return result;
 }

@@ -33,7 +33,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from av_tools import find_ffmpeg_cmd, log, resolve_cli_path
+from av_tools import find_ffmpeg_cmd, log, render_meta_dir, resolve_cli_path
 
 DRIFT_WARN_SEC = 0.4
 MATCH_PREFIX_LEN = 3
@@ -159,7 +159,12 @@ def verify(edit_state_path: Path) -> int:
     # 用 edit_state.json 的原始理想時間，並提醒使用者精準度可能較低
     # ——不要用「理想時間」去對一支「已經被換算成真實時間」的成品，
     # 這正是這支腳本曾經被誤判一整批假警報的成因。
-    timeline_path = render_path.with_suffix(".timeline.json")
+    # 新位置是 06_meta/render_meta/（見 av_tools.render_meta_dir 的說明）；
+    # 舊成品的 sidecar 還留在成品旁邊，所以找不到新位置時要退回去找舊的，
+    # 不然搬家之前出的片會全部退化成用 edit_state 的理想時間比對。
+    timeline_path = render_meta_dir(project_dir) / (render_path.stem + ".timeline.json")
+    if not timeline_path.exists():
+        timeline_path = render_path.with_suffix(".timeline.json")
     if timeline_path.exists():
         with timeline_path.open(encoding="utf-8") as f:
             timeline = json.load(f)
@@ -180,7 +185,8 @@ def verify(edit_state_path: Path) -> int:
     if not words:
         log("[警告] 重新轉錄沒有拿到任何逐字時間戳，無法驗證，請人工聽過確認。")
         return 1
-    verify_words_path = render_path.with_suffix(".verify.words.json")
+    verify_words_path = render_meta_dir(project_dir) / (render_path.stem + ".verify.words.json")
+    verify_words_path.parent.mkdir(parents=True, exist_ok=True)
     verify_words_path.write_text(json.dumps(words, ensure_ascii=False, indent=2),
                                  encoding="utf-8", newline="\n")
     log(f"成品逐字時間戳已寫入：{verify_words_path.name}")

@@ -140,6 +140,20 @@ def srt_timestamp(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def render_meta_dir(project_dir: Path) -> Path:
+    """
+    每次出片會附帶產生的 json（render.py 的 <成品>.timeline.json、
+    verify_render.py 的 <成品>.verify.words.json）統一放這裡。
+
+    這些檔案原本直接寫在成品旁邊（05_render/），但那個資料夾是使用者
+    拿成品的地方，每出一次片就多兩個 json 混在 mp4 裡，很難找。集中到
+    06_meta/render_meta/ 之後，05_render 只會有 mp4。
+
+    這個路徑由 render.py 和 verify_render.py 共用，改位置只要改這裡。
+    """
+    return project_dir / "06_meta" / "render_meta"
+
+
 def ffprobe_duration(ffprobe_cmd: str, media_path: Path) -> float:
     import subprocess
 

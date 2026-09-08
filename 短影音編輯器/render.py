@@ -26,7 +26,8 @@ import sys
 import time
 from pathlib import Path
 
-from av_tools import DEFAULT_FONT_BOLD, find_ffmpeg_cmd, find_magick_cmd, ffprobe_duration, find_ffprobe_cmd, log, resolve_cli_path
+from av_tools import (DEFAULT_FONT_BOLD, find_ffmpeg_cmd, find_magick_cmd, ffprobe_duration,
+                      find_ffprobe_cmd, log, render_meta_dir, resolve_cli_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1107,7 +1108,15 @@ def render(edit_state_path: Path) -> Path:
     # 從幾乎 0 秒加大到 0.2 秒）讓累積落差變大，才讓一堆其實燒得正確的
     # 字幕被誤判成「偷跑」。不要再讓 verify 用理想時間去比對真實成品，
     # 這裡把真正燒進去的時間存下來，verify_render.py 優先讀這份。
-    timeline_path = out_path.with_suffix(".timeline.json")
+    #
+    # 存放位置：06_meta/render_meta/<成品檔名>.timeline.json。原本是直接
+    # 丟在成品旁邊（05_render/），但那個資料夾是使用者拿成品的地方，每出
+    # 一次片就多兩個 json（這份 + verify_render.py 的 .verify.words.json），
+    # 混在 mp4 裡很難找。搬到 06_meta 底下的專用子資料夾，05_render 就只
+    # 會有 mp4。verify_render.py 讀的時候會先找新位置、找不到再找舊位置，
+    # 所以搬之前產生的舊成品仍然驗得動。
+    timeline_path = render_meta_dir(project_dir) / (out_path.stem + ".timeline.json")
+    timeline_path.parent.mkdir(parents=True, exist_ok=True)
     timeline_path.write_text(
         json.dumps({"subtitles": state.get("subtitles", []), "broll": state.get("broll", [])},
                    ensure_ascii=False, indent=2),
