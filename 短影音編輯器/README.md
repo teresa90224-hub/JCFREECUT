@@ -15,9 +15,10 @@
 
 - **ffmpeg**、**ffprobe**（PATH 裡要找得到，或裝在 winget 常見安裝路徑，見
   `av_tools.py` 的 `find_ffmpeg_cmd`）
-- **ImageMagick**（`magick` 指令，目前只用在早期版本，`render.py` 現在的字幕
-  改用 ffmpeg 內建的 `libass`，不再依賴 ImageMagick 燒字幕，但 `find_magick_cmd`
-  還留著給標題/CTA 卡用）
+- **ImageMagick**（`magick` 指令，**還是必要的**）——現在只負責畫底圖：開一張
+  純色畫布，再把字卡 PNG 貼上去（`build_background()`）。字幕從以前就是走
+  ffmpeg 內建的 `libass`；字卡文字則在 2026-09-05 從 ImageMagick 改成 ffmpeg
+  `drawtext`，但「底圖＋合成」這一步仍然是 ImageMagick 在做，沒有它出不了片
 - **auto-editor**（剪掉停頓用）
 - 轉字幕三選一，`new_project.py` 會依序自動偵測、優先序如下：
   1. **Groq API**（設定環境變數 `GROQ_API_KEY` 才會用，最快，見下方說明）
@@ -118,12 +119,20 @@ python caption_editor/server.py
 video_path` 這個檔案自己，不能借用建專案時對原始錄影做的那份）。GUI
 會自動找 `02_transcript/` 或影片旁邊有沒有現成的，沒有才會轉錄一次。
 
-**title/cta/subtitles 的文字不要放 emoji**——字卡是用 ImageMagick 配單一
-中文字型（微軟正黑體）畫出來的，這個字型沒有 emoji 圖案，emoji 會直接
-消失不顯示；就算換成 Windows 內建的 emoji 字型，中文字又會反過來消失
-（兩者是不同字型，這台機器沒有做多字型 fallback 拼接）。這台的
-ImageMagick 也只能畫黑白單色 emoji，不是彩色的，所以就算之後要做
-fallback 拼接，效果也有限。
+**字卡（title/cta）的文字不要放 emoji，字幕（subtitles）可以但只有單色。**
+兩者走的是完全不同的繪製路徑，行為也不一樣（2026-09-08 實測）：
+
+- **字卡**：用 ffmpeg `drawtext` 畫，字型固定綁死單一檔案（`msjhbd.ttc`，
+  微軟正黑體 Bold），這個字型沒有 emoji 圖案，**emoji 會變成空白豆腐框
+  「□」**。最麻煩的是 ffmpeg 不會報錯、exit code 也是 0，出片流程整個
+  正常跑完，不特別去看畫面根本不會發現。
+- **字幕**：用 ffmpeg 內建的 `libass` 燒，libass 會自動做字型 fallback，
+  抓得到 Windows 內建的 emoji 字型，所以 **emoji 畫得出來**——但只有
+  單色（跟字幕本身同一個顏色＋描邊），不是彩色的 emoji。
+
+（2026-09-05 之前字卡是用 ImageMagick 排字，那時候整段結論是「都不要放」；
+現在字卡文字改走 drawtext，ImageMagick 只剩下畫底圖跟把字卡貼上去這兩件事，
+所以結論要分開看。）
 
 ### 存檔自動備份
 
