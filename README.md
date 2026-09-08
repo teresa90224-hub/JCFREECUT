@@ -9,6 +9,8 @@
 `edit_state.json`，`render.py` 照著執行——所以同一份 `edit_state.json` 不管是 AI
 第一次生成、還是之後手動調整過，呼叫 `render.py` 都會得到一致的結果。
 
+> 最近新增／修正了哪些功能，見 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 快速上手（Windows）
 
 **最簡單的方式：下載這個 repo（Code → Download ZIP，或 `git clone`）解壓縮後，

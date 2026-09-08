@@ -20,19 +20,54 @@
   /* 近似即時預覽：video 疊一層絕對定位的字幕/字卡覆蓋層，靠 JS 依目前
      虛擬剪接後時間軸位置換算內容，不呼叫 render.py、不重新編碼。跟畫面
      比例（layout.ratio）連動，讓字卡疊圖位置跟 render.py 實際燒出來的
-     大致對得上（不要求像素級一致，見 refreshApproxPreview 註解）。 */
+     大致對得上（不要求像素級一致，見 refreshApproxPreview 註解）。
+
+     9:16 跟 16:9 在 render.py 裡是兩種完全不同的排版模型（見 render.py
+     開頭 layout 那段註解），這裡的 CSS 要分開對應，不能共用一套百分比：
+     - 9:16（overlay_cards_on_video=False）：主影片維持 16:9 比例、置中
+       貼在畫布中間（video_y=(1920-608)/2=656，video_h=608），標題/CTA
+       各自佔用影片上下的獨立留白區塊（實色底），不會疊在影片畫面上。
+       下面 34.1667%/31.6667%（=656/1920、608/1920）就是照這組數字換算，
+       字卡位置也是照 title_margin=90、cta_margin=120、
+       ass_margin_v=video_y+video_h+60=1324 換算成 canvas_h=1920 的
+       百分比，不是憑感覺調的。
+     - 16:9（overlay_cards_on_video=True）：主影片滿版鋪滿整個畫框，標題
+       改成左上角小標籤、CTA 卡跟字幕都直接疊在滿版影片上面——這組維持
+       原本就有的百分比，跟 9:16 分開，不要互相套用（這正是這次修的
+       bug 成因：9:16 之前誤用了 16:9 這套「滿版疊圖」的百分比）。 */
   .preview-stage { position: relative; width: 100%; background: #000; border-radius: 8px; overflow: hidden; }
-  .preview-stage.ratio-9-16 { aspect-ratio: 9 / 16; max-height: 640px; margin: 0 auto; }
+  .preview-stage.ratio-9-16 { aspect-ratio: 9 / 16; max-height: min(640px, 65vh); margin: 0 auto; }
   .preview-stage.ratio-16-9 { aspect-ratio: 16 / 9; }
-  .preview-stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #000; }
+  .preview-stage video { position: absolute; left: 0; width: 100%; object-fit: cover; background: #000; cursor: pointer; }
+  .preview-stage.ratio-9-16 video { top: 34.1667%; height: 31.6667%; }
+  .preview-stage.ratio-16-9 video { top: 0; height: 100%; }
+  /* 自訂播放列：不能用原生 <video controls>，因為原生進度條/總長度顯示的
+     是「原始素材」的時間軸（例如 19:22），但使用者要預覽的是剪完之後的
+     成品（例如 55 秒）。這一列全部跑虛擬時間軸（kept 片段累加），拖曳
+     時再換算回原始秒數去 seek，被剪掉的部分在這條進度條上根本不存在。 */
+  .approx-transport { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+  .approx-transport button { width: 34px; height: 30px; border: none; border-radius: 6px;
+                             background: #1b1d29; color: #fff; cursor: pointer; font-size: 13px; }
+  .approx-transport button:disabled { background: #999; cursor: not-allowed; }
+  .approx-transport input[type=range] { flex: 1; cursor: pointer; }
+  .approx-transport .t { font-size: 12px; color: #555; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  /* paint-order: stroke fill 很重要，不能拿掉：-webkit-text-stroke 預設是
+     「描邊沿著字的輪廓往內外各畫一半、而且畫在字色的上面」，在預覽這種
+     縮小過的字級上，黑色描邊會把字本身整個吃掉，看起來就是一坨黑（使用者
+     實際回報過「一坨黑嚕嚕啥都看不到」）。正片那邊不管是字幕（libass）
+     還是字卡（drawtext）都是「描邊在下、字色蓋在上」，paint-order 就是
+     在瀏覽器端把畫的順序改成跟正片一致。描邊寬度／陰影不要寫死在這裡，
+     由 JS 依 edit_state 的設定換算（見 applyCardTextStyle）。 */
   .ov-card { position: absolute; left: 4%; right: 4%; margin: 0; text-align: center; pointer-events: none;
              white-space: pre-wrap; word-break: break-word; font-family: "Microsoft JhengHei","Segoe UI",sans-serif;
-             font-weight: bold; line-height: 1.25; display: none; text-shadow: 2px 2px 3px rgba(0,0,0,.6); }
-  .ov-title { top: 4%; }
-  .ov-subtitle { bottom: 20%; }
-  .ov-cta { bottom: 3%; padding: 6px 10px; border-radius: 8px; }
+             font-weight: bold; line-height: 1.25; display: none;
+             paint-order: stroke fill; -webkit-paint-order: stroke fill; }
+  .ov-title { top: 4.6875%; }
+  .ov-subtitle { top: 68.9583%; bottom: auto; }
+  .ov-cta { bottom: 6.25%; padding: 6px 10px; border-radius: 8px; }
   .preview-stage.ratio-16-9 .ov-title { left: 3%; right: auto; text-align: left; top: 3%; max-width: 45%; }
-  .preview-stage.ratio-16-9 .ov-subtitle { bottom: 6%; }
+  .preview-stage.ratio-16-9 .ov-subtitle { top: auto; bottom: 2.5%; }
+  .preview-stage.ratio-16-9 .ov-cta { bottom: 3.7%; }
   #previewModeRow { font-size: 12px; color: #555; margin-bottom: 8px; }
   #previewModeRow label { margin-right: 14px; cursor: pointer; }
   label.field { display: block; font-size: 12px; color: #555; margin: 8px 0 3px; }
@@ -128,6 +163,11 @@
         <div id="ovTitle" class="ov-card ov-title"></div>
         <div id="ovSubtitle" class="ov-card ov-subtitle"></div>
         <div id="ovCta" class="ov-card ov-cta"></div>
+      </div>
+      <div class="approx-transport">
+        <button id="approxPlayBtn" type="button" title="播放／暫停">▶</button>
+        <input type="range" id="approxSeek" min="0" max="0" step="0.01" value="0" title="剪輯後的進度（不含被剪掉的片段）">
+        <span id="approxTime" class="t">0:00 / 0:00</span>
       </div>
     </section>
 
@@ -437,13 +477,107 @@ function buildKeptSegments(clips) {
   });
 }
 
-function applyStageFontSize(el, sizePt) {
+// ---------- 虛擬時間軸（＝剪完之後的成品時間軸）與自訂播放列 ----------
+// 為什麼不能用原生 <video controls>：近似預覽播的是「原始素材」整支檔案
+// （靠 JS 跳過 keep=false 的洞），所以原生播放列顯示的一定是原始素材的
+// 長度（例如 19:22）跟位置，跟使用者真正想預覽的成品（例如 55 秒）對不
+// 上——使用者實際回報過「播放列顯示 19:22 不對，我要預覽就只有這 55 秒
+// 可以看」。這裡改成自己做一組播放列，進度條的範圍就是「剪完的總長度」，
+// 拖曳時把虛擬秒數換算回原始素材的秒數再 seek，被剪掉的片段在這條進度
+// 條上完全不存在，也拖不進去。
+function virtualDuration() {
+  return keptSegments.length ? keptSegments[keptSegments.length - 1].outEnd : 0;
+}
+
+function sourceToVirtual(srcT) {
+  if (!keptSegments.length) return 0;
+  for (const s of keptSegments) {
+    if (srcT >= s.srcStart && srcT <= s.srcEnd) return s.outStart + (srcT - s.srcStart);
+  }
+  // 落在被剪掉的洞裡（或所有片段之外）：算成下一段的開頭，沒有下一段就算成結尾
+  const next = keptSegments.find(s => s.srcStart > srcT);
+  return next ? next.outStart : virtualDuration();
+}
+
+function virtualToSource(vT) {
+  if (!keptSegments.length) return 0;
+  for (const s of keptSegments) {
+    if (vT >= s.outStart && vT <= s.outEnd) return s.srcStart + (vT - s.outStart);
+  }
+  return keptSegments[keptSegments.length - 1].srcEnd;
+}
+
+function fmtClock(sec) {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  return `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, '0')}`;
+}
+
+// 使用者正在拖曳進度條時，不要讓 timeupdate 把滑桿位置搶回去
+let seekBarDragging = false;
+
+// 跳過被剪掉的片段是靠改 video.currentTime 做的，而實測發現：這個
+// <video> 只要一 seek，瀏覽器就會把播放狀態停掉（實測對照組——在同一段
+// 保留片段內、完全沒有跨剪接點的單純 seek，一樣會被暫停，而且當下
+// readyState=4 資料是夠的，不是緩衝不足；我們自己的程式碼全程沒有呼叫
+// 過 pause()）。結果就是預覽播到第一個剪接點跳過去之後就卡住不動，等於
+// 整個預覽不能用。修法：凡是我們自己觸發的 seek，先記住「seek 之前是不是
+// 正在播」，等 seeked 之後如果被停掉就自動續播。使用者自己在暫停狀態下
+// 拖進度條不會被誤觸發（那時 wasPlaying 是 false）。
+let resumeAfterSeek = false;
+function seekVideo(video, t) {
+  if (!video.paused) resumeAfterSeek = true;
+  video.currentTime = t;
+}
+
+function updateTransportUI() {
+  const video = document.getElementById('approxVideo');
+  const bar = document.getElementById('approxSeek');
+  const label = document.getElementById('approxTime');
+  const btn = document.getElementById('approxPlayBtn');
+  if (!bar || !label || !btn) return;
+  const dur = virtualDuration();
+  bar.max = dur.toFixed(2);
+  bar.disabled = dur <= 0;
+  btn.disabled = dur <= 0;
+  const vT = Math.min(sourceToVirtual(video.currentTime), dur);
+  if (!seekBarDragging) bar.value = vT.toFixed(2);
+  label.textContent = `${fmtClock(vT)} / ${fmtClock(dur)}`;
+  btn.textContent = video.paused ? '▶' : '⏸';
+}
+
+// 預覽畫面寬度 ÷ render.py 的畫布寬度：字級、描邊寬度、陰影位移全部要用
+// 同一個比例縮，才會跟正片長得一樣（正片那些數字都是以 1080/1920 寬的
+// 畫布為單位）。
+function stageScale() {
   const stage = document.getElementById('approxStage');
   const ratio = (currentState.layout && currentState.layout.ratio) || '9:16';
   const canvasW = ratio === '16:9' ? 1920 : 1080; // 對應 render.py 的 canvas_w
   const rect = stage.getBoundingClientRect();
-  const scale = rect.width > 0 ? rect.width / canvasW : 0.3;
-  el.style.fontSize = Math.max(8, Math.round(sizePt * scale)) + 'px';
+  return rect.width > 0 ? rect.width / canvasW : 0.3;
+}
+
+function applyStageFontSize(el, sizePt) {
+  el.style.fontSize = Math.max(8, Math.round(sizePt * stageScale())) + 'px';
+}
+
+// 用「正片那一組設定」去畫預覽的文字外觀，不要另外寫死一套：
+//   sizePt / strokeWidthPt / shadowOffsetPt 都是畫布座標的數字（跟
+//   edit_state.json 裡寫的一樣），這裡統一乘上 stageScale() 換算成預覽的
+//   px。描邊靠 -webkit-text-stroke ＋ CSS 的 paint-order: stroke fill
+//   （見 .ov-card 註解）模擬正片「描邊在下、字色在上」的畫法；陰影用
+//   text-shadow 模擬 drawtext 的 shadowx/shadowy。設定成 0 就真的不畫，
+//   不要像之前那樣無視設定硬塞一層陰影。
+function applyCardTextStyle(el, opts) {
+  const scale = stageScale();
+  const strokePx = Math.max(0, (opts.strokeWidthPt || 0) * scale);
+  el.style.webkitTextStroke = strokePx > 0
+    ? `${strokePx.toFixed(2)}px ${opts.strokeColor || '#000000'}`
+    : '';
+  const shadowPx = Math.max(0, (opts.shadowOffsetPt || 0) * scale);
+  el.style.textShadow = shadowPx > 0
+    ? `${shadowPx.toFixed(2)}px ${shadowPx.toFixed(2)}px ${(shadowPx * 0.75).toFixed(2)}px rgba(0,0,0,.6)`
+    : 'none';
+  if (opts.sizePt) applyStageFontSize(el, opts.sizePt);
 }
 
 function renderTitleCtaOverlay() {
@@ -454,15 +588,22 @@ function renderTitleCtaOverlay() {
     titleEl.style.display = 'block';
     // 第一行用 color、第二行（以後）用 color2——對應 render.py
     // render_text_card() 的分行上色規則。
+    // 描邊/陰影用 render_text_card() 的同一組預設值（border 4px 黑、
+    // shadow_offset 4），沒設定就跟正片一樣走預設，不要自己另外訂一套。
+    const border = title.border || { color: '#000000', width: 4 };
     title.text.split('\n').forEach((line, i) => {
       if (!line.trim()) return;
       const div = document.createElement('div');
       div.textContent = line;
       div.style.color = i === 0 ? (title.color || '#FFFFFF') : (title.color2 || title.color || '#FFFFFF');
-      div.style.webkitTextStroke = '1px #000000';
       titleEl.appendChild(div);
     });
-    applyStageFontSize(titleEl, title.size || 52);
+    applyCardTextStyle(titleEl, {
+      sizePt: title.size || 52,
+      strokeColor: border.color || '#000000',
+      strokeWidthPt: border.width == null ? 4 : border.width,
+      shadowOffsetPt: title.shadow_offset == null ? 4 : title.shadow_offset,
+    });
   } else {
     titleEl.style.display = 'none';
   }
@@ -474,8 +615,13 @@ function renderTitleCtaOverlay() {
     ctaEl.textContent = cta.text;
     ctaEl.style.color = cta.color || '#FFFFFF';
     ctaEl.style.background = cta.background || 'transparent';
-    ctaEl.style.webkitTextStroke = '1px #000000';
-    applyStageFontSize(ctaEl, cta.size || 42);
+    const ctaBorder = cta.border || { color: '#000000', width: 4 };
+    applyCardTextStyle(ctaEl, {
+      sizePt: cta.size || 42,
+      strokeColor: ctaBorder.color || '#000000',
+      strokeWidthPt: ctaBorder.width == null ? 4 : ctaBorder.width,
+      shadowOffsetPt: cta.shadow_offset == null ? 4 : cta.shadow_offset,
+    });
   } else {
     ctaEl.style.display = 'none';
   }
@@ -491,9 +637,17 @@ function updateSubtitleOverlay(outputTime) {
   el.style.display = 'block';
   el.textContent = sub.text;
   el.style.color = isEmph ? (style.emphasis_color || '#FF3B30') : (style.color || '#FFFFFF');
-  el.style.webkitTextStroke = Math.max(1, Math.round((style.outline_width || 5) * 0.3)) + 'px ' + (style.outline_color || '#000000');
+  // emphasis 走斜體是照正片來的（build_ass_file 對 emphasis 句會加 \i1）
   el.style.fontStyle = isEmph ? 'italic' : 'normal';
-  applyStageFontSize(el, isEmph ? (style.emphasis_size || 68) : (style.size || 56));
+  // 描邊寬度＝ASS 的 Outline、陰影＝ASS 的 Shadow，直接照 subtitle_style
+  // 換算，不要再自己乘一個沒有根據的係數（之前寫死 outline_width*0.3 再
+  // 至少 1px，在縮小的預覽字級上等於整個字被黑邊糊掉）。
+  applyCardTextStyle(el, {
+    sizePt: isEmph ? (style.emphasis_size || 68) : (style.size || 56),
+    strokeColor: style.outline_color || '#000000',
+    strokeWidthPt: style.outline_width == null ? 5 : style.outline_width,
+    shadowOffsetPt: style.shadow == null ? 0 : style.shadow,
+  });
 }
 
 function ensureApproxVideoSrc() {
@@ -534,13 +688,30 @@ function refreshApproxPreview() {
   const video = document.getElementById('approxVideo');
   if (keptSegments.length) {
     let segIdx = keptSegments.findIndex(s => video.currentTime >= s.srcStart - 0.05 && video.currentTime <= s.srcEnd + 0.05);
-    if (segIdx === -1) segIdx = 0;
+    if (segIdx === -1) {
+      // 播放位置落在 keep=false 的洞裡——最常見的情況是「使用者剛剛在
+      // 逐字編輯區把目前停留的這段剪掉」：clips[] 已經挖好洞、字幕也
+      // 清掉了，但畫面還停在剛被剪掉的那一格上，使用者會以為「剪了怎麼
+      // 還在」（實測重現過：暫停在 401.5 秒刪掉 400.168-403.228 這段，
+      // 播放位置完全沒動）。播放中的 timeupdate 有跳出洞的邏輯，但暫停
+      // 時不會觸發 timeupdate，所以這裡重算剪輯點時要自己補跳一次。
+      const nextIdx = keptSegments.findIndex(s => s.srcStart > video.currentTime);
+      segIdx = nextIdx === -1 ? keptSegments.length - 1 : nextIdx;
+      const target = keptSegments[segIdx].srcStart;
+      // readyState 至少要有 metadata 才有辦法 seek；還沒載好的情況由
+      // loadedmetadata 那支 handler 負責跳到第一段開頭，不用在這裡處理。
+      if (video.readyState >= 1 && Math.abs(video.currentTime - target) > 0.01) {
+        seekVideo(video, target);
+      }
+    }
     const seg = keptSegments[segIdx];
     const clamped = Math.min(Math.max(video.currentTime, seg.srcStart), seg.srcEnd);
     updateSubtitleOverlay(seg.outStart + (clamped - seg.srcStart));
   } else {
     updateSubtitleOverlay(0);
   }
+  // 剪輯點一變，成品總長度就跟著變，播放列的範圍/秒數要一起更新
+  updateTransportUI();
 }
 
 document.getElementById('approxVideo').addEventListener('loadedmetadata', () => {
@@ -562,13 +733,13 @@ document.getElementById('approxVideo').addEventListener('timeupdate', () => {
     const nextIdx = keptSegments.findIndex(s => s.srcStart > video.currentTime);
     if (nextIdx === -1) { video.pause(); return; }
     segIdx = nextIdx;
-    video.currentTime = keptSegments[segIdx].srcStart;
+    seekVideo(video, keptSegments[segIdx].srcStart);
   } else if (video.currentTime >= keptSegments[segIdx].srcEnd - EPS) {
     // 播到這個 keep 片段的尾巴：跳到下一段開頭，最後一段就停止播放
     // （不然會繼續播進後面 keep=false 的區域)。
     if (segIdx + 1 < keptSegments.length) {
       segIdx += 1;
-      video.currentTime = keptSegments[segIdx].srcStart;
+      seekVideo(video, keptSegments[segIdx].srcStart);
     } else {
       video.pause();
     }
@@ -576,6 +747,54 @@ document.getElementById('approxVideo').addEventListener('timeupdate', () => {
   const seg = keptSegments[segIdx];
   const outputTime = seg.outStart + Math.max(0, video.currentTime - seg.srcStart);
   updateSubtitleOverlay(outputTime);
+  updateTransportUI();
+});
+
+// 自訂播放列的三個互動：播放/暫停鈕、進度條、點影片本身也能播放/暫停
+// （原生 controls 已經拿掉了，這些是唯一的操作入口）。
+document.getElementById('approxPlayBtn').addEventListener('click', () => {
+  const video = document.getElementById('approxVideo');
+  if (video.paused) video.play(); else video.pause();
+});
+
+document.getElementById('approxVideo').addEventListener('click', () => {
+  const video = document.getElementById('approxVideo');
+  if (video.paused) video.play(); else video.pause();
+});
+
+['play', 'pause', 'seeked', 'loadedmetadata', 'durationchange'].forEach(ev => {
+  document.getElementById('approxVideo').addEventListener(ev, updateTransportUI);
+});
+
+// seek 完成後把被瀏覽器停掉的播放接回去（見 seekVideo 的註解）。使用者
+// 正在拖進度條的期間不要續播，等他放開（change）之後才接回去，不然拖到
+// 一半會邊拖邊播、位置一直被搶走。
+document.getElementById('approxVideo').addEventListener('seeked', () => {
+  const video = document.getElementById('approxVideo');
+  if (resumeAfterSeek && !seekBarDragging) {
+    resumeAfterSeek = false;
+    if (video.paused) video.play().catch(() => {});
+  }
+});
+
+document.getElementById('approxSeek').addEventListener('input', (e) => {
+  if (!keptSegments.length) return;
+  seekBarDragging = true;
+  const vT = parseFloat(e.target.value);
+  seekVideo(document.getElementById('approxVideo'), virtualToSource(vT));
+  document.getElementById('approxTime').textContent = `${fmtClock(vT)} / ${fmtClock(virtualDuration())}`;
+});
+
+document.getElementById('approxSeek').addEventListener('change', () => {
+  seekBarDragging = false;
+  // 拖曳前如果正在播，放開後要接回去繼續播（拖曳期間 seeked 的續播被
+  // seekBarDragging 擋掉了，這裡補做一次）。
+  const video = document.getElementById('approxVideo');
+  if (resumeAfterSeek) {
+    resumeAfterSeek = false;
+    if (video.paused) video.play().catch(() => {});
+  }
+  updateTransportUI();
 });
 
 document.getElementById('projectSelect').addEventListener('change', async (e) => {
@@ -953,6 +1172,44 @@ document.getElementById('wordStream').addEventListener('mouseout', (e) => {
   if (from && to !== from) scheduleHideHoverTargets();
 });
 
+// 逐字編輯的任何動作（刪字/斷句/取消斷句/設金句/整句重打/改字/拖曳斷句點）
+// 做完都呼叫這個函式，讓即時預覽馬上反映最新的 clips/subtitles——踩過的
+// 坑：使用者在逐字編輯區刪了字，以為（面板上方說明寫「編輯字幕/剪輯點後
+// 幾乎立即反映最新狀態」）預覽會馬上更新，結果那句話其實只對排版/字卡
+// 欄位成立，逐字編輯要另外按「套用到字幕／剪輯點」才會寫進 currentState，
+// 使用者完全不知道要多按這一下，以為「刪了怎麼還在」是 bug。改成每個
+// 動作都自動呼叫跟「套用」按鈕同一支後端 API 去重算 clips/subtitles/
+// broll、更新 currentState——這裡只更新記憶體內的畫面狀態，不寫檔，
+// 使用者還是要自己按「存檔」才會真正寫進 edit_state.json。
+// 呼叫這支 API 是輕量的純運算（不牽涉 ffmpeg），逐字點按這個頻率呼叫
+// 不會卡頓；失敗就靜默略過、維持舊畫面，不因為預覽同步失敗擋住使用者
+// 繼續編輯。
+async function syncPreviewFromWordEdits() {
+  if (!wordState || !currentState || !currentRelPath) return null;
+  let res;
+  try {
+    res = await fetch('/api/apply_word_edits/' + currentRelPath, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        words: wordState,
+        boundaries: Array.from(boundarySet),
+        emphasis: emphasisMap,
+        clips: currentState.clips,
+        broll: currentState.broll || [],
+      }),
+    });
+  } catch (err) {
+    return null;
+  }
+  if (!res.ok) return null;
+  const result = await res.json();
+  currentState.clips = result.clips;
+  currentState.subtitles = result.subtitles;
+  currentState.broll = result.broll;
+  refreshApproxPreview();
+  return result;
+}
+
 document.getElementById('wordStream').addEventListener('click', (e) => {
   const act = e.target.dataset.act;
   if (!act) return;
@@ -982,6 +1239,7 @@ document.getElementById('wordStream').addEventListener('click', (e) => {
     return;
   }
   renderWordStream();
+  syncPreviewFromWordEdits();
 });
 
 // 斷句點「/」拖曳：拖到哪個字上，斷句點就移到那個字前面
@@ -1021,6 +1279,7 @@ document.getElementById('wordStream').addEventListener('drop', (e) => {
   }
   dragBoundaryIndex = null;
   renderWordStream();
+  syncPreviewFromWordEdits();
 });
 
 document.getElementById('wordStream').addEventListener('blur', (e) => {
@@ -1033,6 +1292,7 @@ document.getElementById('wordStream').addEventListener('blur', (e) => {
   if (text !== wordState[i].word) {
     pushUndo();
     wordState[i].word = text;
+    syncPreviewFromWordEdits();
   }
 }, true);
 
@@ -1072,6 +1332,7 @@ function startWholeCardEdit(startI) {
       boundarySet.delete(idxs[k]);
     }
     renderWordStream();
+    syncPreviewFromWordEdits();
   };
   ta.addEventListener('blur', commit);
   ta.addEventListener('keydown', (e) => {
@@ -1079,27 +1340,18 @@ function startWholeCardEdit(startI) {
   });
 }
 
+// 這顆按鈕本身不再是「預覽會不會更新」的關鍵——每個逐字編輯動作現在都
+// 會自動呼叫 syncPreviewFromWordEdits() 即時同步 currentState 了（見該
+// 函式註解）。留著這顆按鈕是給使用者一個明確的「我看過這版、確定要用」
+// 的手動確認點，狀態訊息也在這裡提醒還要記得按「存檔」才會真的寫進
+// edit_state.json。
 document.getElementById('applyWordsBtn').addEventListener('click', async () => {
   const status = document.getElementById('applyStatus');
   status.textContent = '套用中...';
-  const res = await fetch('/api/apply_word_edits/' + currentRelPath, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      words: wordState,
-      boundaries: Array.from(boundarySet),
-      emphasis: emphasisMap,
-      clips: currentState.clips,
-      broll: currentState.broll || [],
-    }),
-  });
-  if (!res.ok) { status.textContent = '套用失敗'; return; }
-  const result = await res.json();
   pushUndo(); // 套用前先記一步，undo 可以整個回到套用之前的 clips/subtitles/broll
-  currentState.clips = result.clips;
-  currentState.subtitles = result.subtitles;
-  currentState.broll = result.broll;
+  const result = await syncPreviewFromWordEdits();
+  if (!result) { status.textContent = '套用失敗'; return; }
   status.textContent = `已套用（${result.subtitles.length} 句字幕、${result.clips.filter(c=>!c.keep).length} 段剪掉）— 記得按上面「存檔」才會寫回檔案`;
-  refreshApproxPreview(); // 即時預覽幾乎立即反映套用後的最新字幕/剪輯點
 });
 
 loadProjectList();
